@@ -1,3 +1,6 @@
-.claude/
+build/
 node_modules/
-dist/
+package-lock.json
+*.o
+*.node
+.claude/
