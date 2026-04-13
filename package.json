@@ -1,0 +1,21 @@
+{
+  "name": "asm-bufferutil",
+  "version": "1.0.0",
+  "description": "WebSocket buffer utils with hand-written x86-64 assembly (SSE2 SIMD) — drop-in replacement for bufferutil",
+  "main": "index.js",
+  "scripts": {
+    "install": "node-gyp rebuild",
+    "build": "node-gyp rebuild",
+    "test": "node test.js",
+    "bench": "node bench.js"
+  },
+  "dependencies": {
+    "node-gyp": "^10.0.0"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "os": ["linux"],
+  "cpu": ["x64"],
+  "license": "MIT"
+}
