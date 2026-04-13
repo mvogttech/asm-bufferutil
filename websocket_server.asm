@@ -102,6 +102,7 @@ section .bss
     sha1_block:     resb 128        ; SHA-1 padded message block
     client_fd:      resq 1          ; client socket fd
     server_fd:      resq 1          ; server socket fd
+    use_scalar_parse:   resb 1      ; set to 1 if BMI2/LZCNT not available
 
 section .text
     global _start
@@ -128,6 +129,34 @@ _start:
     lea r10, [optval]
     mov r8, 4
     syscall
+
+    ; Detect BMI2 (CPUID.7.0:EBX bit 8) and LZCNT (CPUID.0x80000001:ECX bit 5)
+    push rbx
+    xor eax, eax
+    cpuid
+    cmp eax, 7
+    jl .set_scalar
+
+    mov eax, 7
+    xor ecx, ecx
+    cpuid
+    test ebx, (1 << 8)              ; BMI2
+    jz .set_scalar
+
+    mov eax, 0x80000000
+    cpuid
+    cmp eax, 0x80000001
+    jl .set_scalar
+    mov eax, 0x80000001
+    cpuid
+    test ecx, (1 << 5)              ; LZCNT
+    jnz .detect_done
+
+.set_scalar:
+    mov byte [use_scalar_parse], 1
+
+.detect_done:
+    pop rbx
 
     ; Bind
     mov rax, SYS_BIND
@@ -286,29 +315,66 @@ _start:
     mov r15, rax
 
     ; Parse WebSocket frame header
-    movzx eax, byte [recv_buf]      ; first byte: FIN + opcode
-    mov r12d, eax
-    and r12d, 0x0F                  ; opcode
+    cmp byte [use_scalar_parse], 0
+    jne .ws_parse_scalar
 
-    ; Check for close frame
+    ; --- PEXT path (BMI2) ---
+    movzx eax, word [recv_buf]      ; load bytes 0 and 1 together
+    pext  r12d, eax, 0x000F         ; r12d = opcode  (byte0 bits 3:0)
+    pext  r13d, eax, 0x7F00         ; r13d = payload_len (byte1 bits 6:0, shifted down)
+    pext  r8d,  eax, 0x8000         ; r8d  = mask flag (byte1 bit 7)
+    test  r8d, r8d
+    jz   .close_client              ; unmasked client frame = protocol error
+    jmp  .ws_parse_check_opcode
+
+.ws_parse_scalar:
+    ; --- Original scalar path (fallback) ---
+    movzx eax, byte [recv_buf]
+    mov r12d, eax
+    and r12d, 0x0F
+    movzx eax, byte [recv_buf + 1]
+    mov r13d, eax
+    and r13d, 0x7F
+    test eax, 0x80
+    jz .close_client
+
+.ws_parse_check_opcode:
     cmp r12d, WS_CLOSE
     je .close_client
-
-    ; Check for ping -> send pong
     cmp r12d, WS_PING
     je .send_pong
 
-    movzx eax, byte [recv_buf + 1]  ; second byte: MASK + payload length
-    mov r13d, eax
-    and r13d, 0x7F                  ; payload length (lower 7 bits)
-    
-    ; Check if masked (client frames MUST be masked)
-    test eax, 0x80
-    jz .close_client                ; not masked = protocol error
+    ; Dispatch on payload length encoding
+    cmp byte [use_scalar_parse], 0
+    jne .ws_len_scalar
 
-    ; For simplicity, only handle payload <= 125 bytes
+    ; --- LZCNT path ---
+    lzcnt eax, r13d
+    ; lzcnt(0..125) >= 25 — but any value < 126 has lzcnt >= 1
+    ; lzcnt(126) = 25, lzcnt(127) = 24
+    cmp eax, 25
+    jl  .ws_len_inline              ; 0-125: 7-bit inline length, already in r13d
+    je  .ws_len_16bit               ; 126: next 2 bytes are length (big-endian)
+    jmp .ws_len_reject              ; 127: 64-bit length, reject (too large for this server)
+
+.ws_len_scalar:
     cmp r13d, 126
-    jge .close_client
+    jge .ws_len_reject
+
+.ws_len_inline:
+    jmp .ws_len_done
+
+.ws_len_16bit:
+    ; Read 2-byte big-endian extended length (after masking key at recv_buf+2)
+    ; Note: masking key occupies recv_buf+2..+5 in the extended case
+    ; RFC 6455: for 126, the extended length is at bytes 2-3, mask at bytes 4-7
+    movzx r13d, word [recv_buf + 2]
+    rorx  r13d, r13d, 8             ; byte-swap to host order without touching flags
+
+.ws_len_reject:
+    jmp .close_client
+
+.ws_len_done:
 
     ; Masking key starts at offset 2
     ; Payload starts at offset 6
