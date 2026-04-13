@@ -1,5 +1,9 @@
 # asm-bufferutil
 
+[![CI](https://github.com/mvogttech/asm-bufferutil/actions/workflows/ci.yml/badge.svg)](https://github.com/mvogttech/asm-bufferutil/actions/workflows/ci.yml)
+[![npm version](https://img.shields.io/npm/v/asm-bufferutil.svg)](https://www.npmjs.com/package/asm-bufferutil)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 **WebSocket frame masking in hand-written x86-64 assembly with SSE2 SIMD.**
 
 A drop-in replacement for [`bufferutil`](https://github.com/websockets/bufferutil) — the native addon that makes the [`ws`](https://github.com/websockets/ws) WebSocket library fast. Instead of C, the hot path is written in NASM assembly with SSE2 vectorized XOR operations.
@@ -59,7 +63,9 @@ Since the mask repeats every 4 bytes and 16 is a multiple of 4, the broadcast tr
 
 ## Build
 
-Prerequisites: `nasm`, `node-gyp`, Node.js ≥ 16, Linux x86-64.
+Prerequisites: `nasm`, `node-gyp`, Node.js ≥ 16, **Linux x86-64** for native SIMD paths.
+
+On Windows and macOS, `npm install` will compile the C layer only. The assembly SIMD paths are Linux x86-64 exclusive. The pure JavaScript fallback is used automatically on other platforms.
 
 ```bash
 # Install NASM (Ubuntu/Debian)
@@ -152,14 +158,26 @@ import { WebApp } from 'meteor/webapp';
 
 ```
 asm-bufferutil/
-├── binding.gyp          # node-gyp build config
-├── package.json
-├── index.js             # JS entry point with fallback
 ├── src/
-│   ├── ws_mask_asm.asm  # The assembly hot path
-│   └── ws_napi.c        # N-API C wrapper
-├── test.js              # Correctness tests
-├── bench.js             # Performance benchmarks
+│   ├── ws_napi.c               # N-API C glue layer
+│   ├── ws_sha1_ni.c            # SHA-1 with Intel SHA-NI intrinsics
+│   ├── ws_mask_asm.asm         # XOR masking (SSE2/NT-store dispatch)
+│   ├── ws_base64_asm.asm       # Base64 (AVX2/GFNI/SSE2/scalar dispatch)
+│   ├── ws_cpu.asm              # CPU feature detection + tier bitmask
+│   ├── ws_crc32_asm.asm        # CRC32 (SSE4.2)
+│   └── websocket_server.asm    # WebSocket server-side frame assembly
+├── test/
+│   ├── index.js                # Correctness test suite
+│   ├── crc32.c                 # C-level CRC32 harness
+│   └── client.html             # Browser WebSocket test client
+├── bench/
+│   └── index.js                # Throughput benchmarks
+├── .github/workflows/ci.yml
+├── binding.gyp                 # node-gyp build config
+├── index.js                    # JS entry point with native/fallback dispatch
+├── package.json
+├── CHANGELOG.md
+├── CONTRIBUTING.md
 └── README.md
 ```
 
