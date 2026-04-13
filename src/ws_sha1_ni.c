@@ -5,13 +5,21 @@
 #include <stdint.h>
 #include <string.h>
 #include <immintrin.h>
-#include <cpuid.h>
 
+#ifdef _MSC_VER
+int ws_has_sha_ni(void) {
+    int info[4];
+    __cpuidex(info, 7, 0);
+    return (info[1] >> 29) & 1;
+}
+#else
+#include <cpuid.h>
 int ws_has_sha_ni(void) {
     unsigned int a,b,c,d;
     if (__get_cpuid_count(7,0,&a,&b,&c,&d)) return (b>>29)&1;
     return 0;
 }
+#endif
 
 static void sha1_ni_block(uint32_t state[5], const uint8_t data[64]) {
     __m128i ABCD, ABCD_SAVE, E0, E0_SAVE, E1;

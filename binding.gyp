@@ -7,6 +7,9 @@
         "src/ws_sha1_ni.c"
       ],
       "conditions": [
+        ["OS!='linux' or target_arch!='x64'", {
+          "sources": ["src/ws_fallback.c"]
+        }],
         ["OS=='linux' and target_arch=='x64'", {
           "actions": [
             {
