@@ -1,5 +1,5 @@
-; ws_cpu.asm — CPU tier and feature bitmask detection
-; Exports: cpu_tier (dd), cpu_features (dd), _init_cpu_features
+; ws_cpu.asm — CPU tier, feature bitmask, and cache topology detection
+; Exports: cpu_tier (dd), cpu_features (dd), nt_threshold (dq), _init_cpu_features
 ;
 ; cpu_tier values:
 ;   0 = scalar only
@@ -20,13 +20,16 @@ DEFAULT REL
 
 section .data
     align 4
-    cpu_tier:     dd 0
-    cpu_features: dd 0
+    cpu_tier:      dd 0
+    cpu_features:  dd 0
+    align 8
+    nt_threshold:  dq (1 << 23)     ; default 8MB, updated from L3 cache size at init
 
 section .text
 
 global cpu_tier:data hidden
 global cpu_features:data hidden
+global nt_threshold:data hidden
 global _init_cpu_features
 
 ; Register allocation across the function:
@@ -135,12 +138,86 @@ _init_cpu_features:
     mov eax, 0x80000000
     cpuid
     cmp eax, 0x80000001
-    jl .all_done
+    jl .detect_cache
     mov eax, 0x80000001
     cpuid
     test ecx, (1 << 5)
-    jz .all_done
+    jz .detect_cache
     or dword [cpu_features], 8
+
+.detect_cache:
+    ; === Cache topology: detect L3 size, set nt_threshold to 50% of L3 ===
+    ; AMD uses leaf 0x8000001D, Intel uses leaf 0x04 — same field layout.
+    xor r8, r8                      ; r8 = largest cache size found
+
+    test dword [cpu_features], (1 << 5)
+    jz .cache_intel
+
+    ; AMD: check extended leaf 0x8000001D is available
+    mov eax, 0x80000000
+    cpuid
+    cmp eax, 0x8000001D
+    jb .cache_set_threshold
+    mov r9d, 0x8000001D
+    jmp .cache_iterate
+
+.cache_intel:
+    ; Intel: check basic leaf 0x04 is available
+    xor eax, eax
+    cpuid
+    cmp eax, 4
+    jb .cache_set_threshold
+    mov r9d, 4
+
+.cache_iterate:
+    xor r10d, r10d                  ; r10d = subleaf index
+
+.cache_loop:
+    mov eax, r9d
+    mov ecx, r10d
+    cpuid
+
+    ; EAX[4:0] = cache type (0 = no more caches)
+    test eax, 0x1F
+    jz .cache_set_threshold
+
+    ; size = (Ways+1) * (Partitions+1) * (LineSize+1) * (Sets+1)
+    mov edi, ecx
+    inc edi                         ; edi = Sets+1
+
+    mov eax, ebx
+    shr eax, 22
+    inc eax                         ; eax = Ways+1
+
+    mov ecx, ebx
+    shr ecx, 12
+    and ecx, 0x3FF
+    inc ecx                         ; ecx = Partitions+1
+
+    and ebx, 0xFFF
+    inc ebx                         ; ebx = LineSize+1
+
+    imul eax, ecx                   ; Ways * Partitions
+    imul eax, ebx                   ; Ways * Partitions * LineSize
+    mov ecx, eax
+    imul rcx, rdi                   ; 64-bit: * Sets → total cache size
+
+    cmp rcx, r8
+    jbe .cache_next
+    mov r8, rcx                     ; new max
+
+.cache_next:
+    inc r10d
+    jmp .cache_loop
+
+.cache_set_threshold:
+    test r8, r8
+    jz .all_done                    ; no cache detected, keep 8MB default
+    shr r8, 1                       ; 50% of largest cache
+
+    cmp r8, (1 << 23)
+    jb .all_done                    ; below 8MB floor, keep default
+    mov [nt_threshold], r8
 
 .all_done:
     pop r12

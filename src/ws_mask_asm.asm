@@ -28,6 +28,7 @@ DEFAULT REL
 
 extern cpu_tier
 extern cpu_features
+extern nt_threshold
 
 ; Skip vzeroupper on AMD (no SSE/AVX transition penalty on Zen).
 ; On Intel the branch falls through to vzeroupper as normal.
@@ -96,7 +97,7 @@ ws_mask:
 .m_avx512:
     vpbroadcastd zmm0, r8d
 
-    cmp rcx, (1 << 23)          ; >= 8MB → NT path
+    cmp rcx, [nt_threshold]     ; >= NT threshold → NT path
     jae .m_nt512
 
     ; 8x unrolled: 512 bytes/iter
@@ -234,7 +235,7 @@ ws_mask:
     vmovd xmm0, r8d
     vpbroadcastd ymm0, xmm0
 
-    cmp rcx, (1 << 23)          ; >= 8MB → NT path
+    cmp rcx, [nt_threshold]     ; >= NT threshold → NT path
     jae .m_nt_avx2
 
     mov rax, rcx
@@ -480,7 +481,7 @@ ws_unmask:
 .u_avx512:
     vpbroadcastd zmm0, r8d
 
-    cmp rcx, (1 << 23)          ; >= 8MB → NT path
+    cmp rcx, [nt_threshold]     ; >= NT threshold → NT path
     jae .u_nt512
 
     ; Dual-stream: process 256 bytes from front + 256 from back per iteration.
@@ -621,7 +622,7 @@ ws_unmask:
     vmovd xmm0, r8d
     vpbroadcastd ymm0, xmm0
 
-    cmp rcx, (1 << 23)          ; >= 8MB → NT path
+    cmp rcx, [nt_threshold]     ; >= NT threshold → NT path
     jae .u_nt_avx2
 
     mov rax, rcx
