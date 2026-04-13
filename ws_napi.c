@@ -13,6 +13,12 @@ extern int64_t ws_find_header(const uint8_t *buf, size_t len,
                                const uint8_t *needle, size_t needle_len);
 extern size_t ws_base64_encode(const uint8_t *in, size_t len, uint8_t *out);
 
+/* CPU feature bitmask populated by _init_cpu_features() in ws_cpu.asm */
+extern uint32_t cpu_features;
+
+/* Internal CRC32 — SSE4.2 based, not N-API exported */
+extern uint32_t ws_crc32(const uint8_t *buf, size_t len, uint32_t init);
+
 /* C functions (ws_sha1_ni.c) */
 extern int  ws_has_sha_ni(void);
 extern void ws_sha1_ni(const uint8_t *msg, size_t len, uint8_t out[20]);
@@ -97,6 +103,10 @@ static napi_value Init(napi_env env, napi_value exports) {
     napi_value sha_val;
     napi_create_int32(env, ws_has_sha_ni(), &sha_val);
     napi_set_named_property(env, exports, "hasShaNi", sha_val);
+
+    napi_value feats_val;
+    napi_create_uint32(env, cpu_features, &feats_val);
+    napi_set_named_property(env, exports, "cpuFeatures", feats_val);
 
     return exports;
 }
