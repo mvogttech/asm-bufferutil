@@ -12,7 +12,7 @@
     "install": "node-gyp rebuild",
     "build": "node-gyp rebuild",
     "test": "node test/index.js",
-    "bench": "node bench/index.js"
+    "bench": "node --expose-gc bench/index.js"
   },
   "keywords": [
     "websocket",

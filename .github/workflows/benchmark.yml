@@ -32,7 +32,7 @@ jobs:
         run: npm run build
 
       - name: Run benchmark
-        run: npm run bench 2>&1 | tee bench-output.txt
+        run: node --expose-gc bench/index.js 2>&1 | tee bench-output.txt
 
       - name: Upload benchmark results
         uses: actions/upload-artifact@v4

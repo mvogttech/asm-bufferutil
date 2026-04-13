@@ -1,38 +1,62 @@
 'use strict';
 
 /**
- * Benchmark: Assembly SSE2 vs bufferutil vs Pure JavaScript WebSocket masking
+ * Benchmark: Assembly SIMD vs bufferutil vs Pure JavaScript WebSocket operations
  *
- * Measures throughput for mask and unmask operations across
- * different payload sizes to show where SIMD acceleration
- * provides the most benefit.
+ * Improvements over naive benchmarking:
+ *   - Time-based iteration (minimum 1s per sample) instead of fixed counts
+ *   - Multiple samples with median/min/max reporting
+ *   - Proper warmup phase (500ms) to let V8 JIT compile hot paths
+ *   - GC between tests (when --expose-gc is available)
+ *   - All exported operations: mask, unmask, sha1, findHeader, base64Encode
+ *   - Throughput (MB/s) alongside ops/s
  */
 
 const crypto = require('crypto');
 
-// Load assembly implementation
+// ── Configuration ───────────────────────────────────────────────────────────
+
+const WARMUP_MS = 500;
+const SAMPLE_MS = 1000;
+const SAMPLES = 5;
+
+// ── Load implementations ────────────────────────────────────────────────────
+
 let asmUtil;
 try {
   asmUtil = require('../build/Release/asm_bufferutil.node');
-  console.log('asm-bufferutil : native assembly (SSE2) ✓');
+  console.log('asm-bufferutil : native assembly (SIMD) \u2713');
+  console.log('  cpuFeatures  : 0x' + asmUtil.cpuFeatures.toString(16));
+  if (asmUtil.hasShaNi) console.log('  SHA-NI       : available');
 } catch (e) {
-  console.log('asm-bufferutil : not built — run `npm run build` first');
+  console.log('asm-bufferutil : not built \u2014 run `npm run build` first');
   asmUtil = null;
 }
 
-// Load upstream bufferutil for comparison
 let buUtil;
 try {
   buUtil = require('bufferutil');
-  console.log('bufferutil     : native addon ✓');
+  console.log('bufferutil     : native addon \u2713');
 } catch (e) {
-  console.log('bufferutil     : not installed — run `npm install bufferutil` to include');
+  console.log('bufferutil     : not installed');
   buUtil = null;
 }
 
 console.log();
 
-// Pure JS reference
+// ── GC helper ───────────────────────────────────────────────────────────────
+
+const canGC = typeof global.gc === 'function';
+if (!canGC) {
+  console.log('Tip: run with --expose-gc for more stable results\n');
+}
+
+function collectGarbage() {
+  if (canGC) global.gc();
+}
+
+// ── Pure JS reference implementations ───────────────────────────────────────
+
 const jsUtil = {
   mask(source, mask, output, offset, length) {
     for (let i = 0; i < length; i++) {
@@ -46,25 +70,78 @@ const jsUtil = {
   }
 };
 
-function bench(fn, iterations) {
-  // Warmup
-  for (let i = 0; i < Math.min(iterations, 100); i++) fn();
+// ── Benchmark engine ────────────────────────────────────────────────────────
 
-  const start = process.hrtime.bigint();
-  for (let i = 0; i < iterations; i++) fn();
-  const elapsed = Number(process.hrtime.bigint() - start) / 1e6; // ms
-
-  return (iterations / elapsed) * 1000; // ops/sec
+/**
+ * Run fn() in a tight loop for at least `durationMs` milliseconds.
+ * Returns { ops, elapsed } where elapsed is in ms.
+ */
+function timedRun(fn, durationMs) {
+  const deadline = process.hrtime.bigint() + BigInt(durationMs) * 1_000_000n;
+  let ops = 0;
+  while (process.hrtime.bigint() < deadline) {
+    fn(); fn(); fn(); fn(); fn();
+    fn(); fn(); fn(); fn(); fn();
+    ops += 10;
+  }
+  const end = process.hrtime.bigint();
+  const elapsed = Number(end - (deadline - BigInt(durationMs) * 1_000_000n)) / 1e6;
+  return { ops, elapsed };
 }
 
+/**
+ * Benchmark a function: warmup, then collect multiple samples.
+ * Returns { median, min, max, samples[] } in ops/sec.
+ */
+function benchmark(fn) {
+  // Warmup
+  timedRun(fn, WARMUP_MS);
+
+  const results = [];
+  for (let i = 0; i < SAMPLES; i++) {
+    const { ops, elapsed } = timedRun(fn, SAMPLE_MS);
+    results.push((ops / elapsed) * 1000);
+  }
+
+  results.sort((a, b) => a - b);
+  return {
+    median: results[Math.floor(results.length / 2)],
+    min: results[0],
+    max: results[results.length - 1],
+    samples: results
+  };
+}
+
+// ── Formatting ──────────────────────────────────────────────────────────────
+
 function fmtOps(n) {
-  return n !== null ? n.toFixed(0).padStart(15) : '—'.padStart(15);
+  if (n === null) return '\u2014'.padStart(12);
+  if (n >= 1e6) return (n / 1e6).toFixed(2).padStart(9) + 'M  ';
+  if (n >= 1e3) return (n / 1e3).toFixed(1).padStart(9) + 'K  ';
+  return n.toFixed(0).padStart(12);
+}
+
+function fmtThroughput(opsPerSec, payloadBytes) {
+  if (opsPerSec === null) return '\u2014'.padStart(10);
+  const mbps = (opsPerSec * payloadBytes) / (1024 * 1024);
+  if (mbps >= 1024) return (mbps / 1024).toFixed(1).padStart(7) + ' GB/s';
+  return mbps.toFixed(1).padStart(7) + ' MB/s';
 }
 
 function fmtSpeedup(asm, reference) {
-  if (asm === null || reference === null) return 'N/A';
-  return (asm / reference).toFixed(2) + 'x';
+  if (asm === null || reference === null) return '  \u2014  ';
+  const ratio = asm / reference;
+  const str = ratio.toFixed(2) + 'x';
+  return ratio >= 1.0 ? str : str;
 }
+
+function fmtRange(result) {
+  if (result === null) return '';
+  const spread = ((result.max - result.min) / result.median * 100).toFixed(1);
+  return `\u00b1${spread}%`;
+}
+
+// ── Payload sizes ───────────────────────────────────────────────────────────
 
 const sizes = [
   { name: '64 B',   size: 64 },
@@ -74,52 +151,211 @@ const sizes = [
   { name: '64 KB',  size: 65536 },
   { name: '256 KB', size: 262144 },
   { name: '1 MB',   size: 1048576 },
+  { name: '4 MB',   size: 4194304 },
 ];
 
-// ── Mask ─────────────────────────────────────────────────────────────────────
+// ── Mask benchmark ──────────────────────────────────────────────────────────
 
-console.log('=== WebSocket Mask Benchmark ===');
-console.log('Payload Size  │ JS (ops/s)      │ bufferutil (ops/s) │ ASM (ops/s)      │ vs bufferutil');
-console.log('──────────────┼─────────────────┼────────────────────┼──────────────────┼──────────────');
+console.log('=== WebSocket Mask ===');
+console.log(
+  'Size'.padEnd(10) +
+  '  JS ops/s'.padEnd(14) +
+  '  bufferutil'.padEnd(14) +
+  '  ASM ops/s'.padEnd(14) +
+  '  ASM MB/s'.padEnd(12) +
+  '  vs BU'.padEnd(9) +
+  '  spread'
+);
+console.log('\u2500'.repeat(80));
 
 for (const { name, size } of sizes) {
   const source = crypto.randomBytes(size);
   const mask   = crypto.randomBytes(4);
   const output = Buffer.alloc(size);
-  const iters  = Math.max(100, Math.floor(5_000_000 / size));
 
-  const jsOps  = bench(() => jsUtil.mask(source, mask, output, 0, size), iters);
-  const buOps  = buUtil  ? bench(() => buUtil.mask(source, mask, output, 0, size), iters) : null;
-  const asmOps = asmUtil ? bench(() => asmUtil.mask(source, mask, output, 0, size), iters) : null;
+  collectGarbage();
+  const jsRes  = benchmark(() => jsUtil.mask(source, mask, output, 0, size));
+  collectGarbage();
+  const buRes  = buUtil ? benchmark(() => buUtil.mask(source, mask, output, 0, size)) : null;
+  collectGarbage();
+  const asmRes = asmUtil ? benchmark(() => asmUtil.mask(source, mask, output, 0, size)) : null;
 
-  const vsRef = fmtSpeedup(asmOps, buOps ?? jsOps);
-
+  const ref = buRes ?? jsRes;
   console.log(
-    `${name.padEnd(13)} │ ${fmtOps(jsOps)}   │ ${fmtOps(buOps)}     │ ${fmtOps(asmOps)}     │ ${vsRef}`
+    name.padEnd(10) +
+    fmtOps(jsRes.median) +
+    fmtOps(buRes?.median ?? null) +
+    fmtOps(asmRes?.median ?? null) +
+    fmtThroughput(asmRes?.median ?? null, size).padStart(12) +
+    fmtSpeedup(asmRes?.median ?? null, ref.median).padStart(9) +
+    ('  ' + fmtRange(asmRes))
   );
 }
 
-// ── Unmask ───────────────────────────────────────────────────────────────────
+// ── Unmask benchmark ────────────────────────────────────────────────────────
 
-console.log('\n=== WebSocket Unmask Benchmark ===');
-console.log('Payload Size  │ JS (ops/s)      │ bufferutil (ops/s) │ ASM (ops/s)      │ vs bufferutil');
-console.log('──────────────┼─────────────────┼────────────────────┼──────────────────┼──────────────');
+console.log('\n=== WebSocket Unmask ===');
+console.log(
+  'Size'.padEnd(10) +
+  '  JS ops/s'.padEnd(14) +
+  '  bufferutil'.padEnd(14) +
+  '  ASM ops/s'.padEnd(14) +
+  '  ASM MB/s'.padEnd(12) +
+  '  vs BU'.padEnd(9) +
+  '  spread'
+);
+console.log('\u2500'.repeat(80));
 
 for (const { name, size } of sizes) {
-  const mask  = crypto.randomBytes(4);
-  const buf   = crypto.randomBytes(size);
-  const iters = Math.max(100, Math.floor(5_000_000 / size));
+  const mask = crypto.randomBytes(4);
+  const buf  = crypto.randomBytes(size);
 
-  const jsOps  = bench(() => jsUtil.unmask(buf, mask), iters);
-  const buOps  = buUtil  ? bench(() => buUtil.unmask(buf, mask), iters) : null;
-  const asmOps = asmUtil ? bench(() => asmUtil.unmask(buf, mask), iters) : null;
+  collectGarbage();
+  const jsRes  = benchmark(() => jsUtil.unmask(buf, mask));
+  collectGarbage();
+  const buRes  = buUtil ? benchmark(() => buUtil.unmask(buf, mask)) : null;
+  collectGarbage();
+  const asmRes = asmUtil ? benchmark(() => asmUtil.unmask(buf, mask)) : null;
 
-  const vsRef = fmtSpeedup(asmOps, buOps ?? jsOps);
-
+  const ref = buRes ?? jsRes;
   console.log(
-    `${name.padEnd(13)} │ ${fmtOps(jsOps)}   │ ${fmtOps(buOps)}     │ ${fmtOps(asmOps)}     │ ${vsRef}`
+    name.padEnd(10) +
+    fmtOps(jsRes.median) +
+    fmtOps(buRes?.median ?? null) +
+    fmtOps(asmRes?.median ?? null) +
+    fmtThroughput(asmRes?.median ?? null, size).padStart(12) +
+    fmtSpeedup(asmRes?.median ?? null, ref.median).padStart(9) +
+    ('  ' + fmtRange(asmRes))
   );
 }
 
-console.log('\nNote: "vs bufferutil" falls back to "vs JS" when bufferutil is not installed.');
-console.log('ASM advantage grows with payload size due to SSE2 processing 16 bytes/cycle.\n');
+// ── SHA-1 benchmark ─────────────────────────────────────────────────────────
+
+if (asmUtil?.hasShaNi) {
+  console.log('\n=== SHA-1 (SHA-NI vs crypto) ===');
+  console.log(
+    'Size'.padEnd(10) +
+    '  crypto'.padEnd(14) +
+    '  ASM ops/s'.padEnd(14) +
+    '  ASM MB/s'.padEnd(12) +
+    '  vs crypto'.padEnd(11) +
+    '  spread'
+  );
+  console.log('\u2500'.repeat(65));
+
+  // ws_sha1_ni supports up to 119 bytes (2 SHA-1 blocks, WebSocket handshake use)
+  const shaSizes = [
+    { name: '20 B',   size: 20 },
+    { name: '36 B',   size: 36 },
+    { name: '60 B',   size: 60 },   // typical Sec-WebSocket-Accept input
+    { name: '100 B',  size: 100 },
+  ];
+
+  for (const { name, size } of shaSizes) {
+    const data = crypto.randomBytes(size);
+
+    collectGarbage();
+    const cryptoRes = benchmark(() => crypto.createHash('sha1').update(data).digest());
+    collectGarbage();
+    const asmRes = benchmark(() => asmUtil.sha1(data));
+
+    console.log(
+      name.padEnd(10) +
+      fmtOps(cryptoRes.median) +
+      fmtOps(asmRes.median) +
+      fmtThroughput(asmRes.median, size).padStart(12) +
+      fmtSpeedup(asmRes.median, cryptoRes.median).padStart(11) +
+      ('  ' + fmtRange(asmRes))
+    );
+  }
+}
+
+// ── Base64 benchmark ────────────────────────────────────────────────────────
+
+if (asmUtil) {
+  console.log('\n=== Base64 Encode (ASM vs Buffer.toString) ===');
+  console.log(
+    'Size'.padEnd(10) +
+    '  JS ops/s'.padEnd(14) +
+    '  ASM ops/s'.padEnd(14) +
+    '  ASM MB/s'.padEnd(12) +
+    '  vs JS'.padEnd(9) +
+    '  spread'
+  );
+  console.log('\u2500'.repeat(65));
+
+  const b64Sizes = [
+    { name: '20 B',   size: 20 },
+    { name: '256 B',  size: 256 },
+    { name: '1 KB',   size: 1024 },
+    { name: '16 KB',  size: 16384 },
+  ];
+
+  for (const { name, size } of b64Sizes) {
+    const data = crypto.randomBytes(size);
+
+    collectGarbage();
+    const jsRes  = benchmark(() => data.toString('base64'));
+    collectGarbage();
+    const asmRes = benchmark(() => asmUtil.base64Encode(data));
+
+    console.log(
+      name.padEnd(10) +
+      fmtOps(jsRes.median) +
+      fmtOps(asmRes.median) +
+      fmtThroughput(asmRes.median, size).padStart(12) +
+      fmtSpeedup(asmRes.median, jsRes.median).padStart(9) +
+      ('  ' + fmtRange(asmRes))
+    );
+  }
+}
+
+// ── Header search benchmark ─────────────────────────────────────────────────
+
+if (asmUtil) {
+  console.log('\n=== Header Search (findHeader) ===');
+  console.log(
+    'Size'.padEnd(10) +
+    '  JS ops/s'.padEnd(14) +
+    '  ASM ops/s'.padEnd(14) +
+    '  vs JS'.padEnd(9) +
+    '  spread'
+  );
+  console.log('\u2500'.repeat(55));
+
+  const needle = Buffer.from('\r\n\r\n');
+  const hdSizes = [
+    { name: '256 B',  size: 256 },
+    { name: '1 KB',   size: 1024 },
+    { name: '4 KB',   size: 4096 },
+    { name: '16 KB',  size: 16384 },
+  ];
+
+  for (const { name, size } of hdSizes) {
+    // Place the needle near the end so the search does real work
+    const data = crypto.randomBytes(size);
+    data[size - 5] = 0x0d; // \r
+    data[size - 4] = 0x0a; // \n
+    data[size - 3] = 0x0d; // \r
+    data[size - 2] = 0x0a; // \n
+
+    collectGarbage();
+    const jsRes  = benchmark(() => data.indexOf(needle));
+    collectGarbage();
+    const asmRes = benchmark(() => asmUtil.findHeader(data, needle));
+
+    console.log(
+      name.padEnd(10) +
+      fmtOps(jsRes.median) +
+      fmtOps(asmRes.median) +
+      fmtSpeedup(asmRes.median, jsRes.median).padStart(9) +
+      ('  ' + fmtRange(asmRes))
+    );
+  }
+}
+
+console.log('\n' + '\u2500'.repeat(80));
+console.log('Config: warmup=' + WARMUP_MS + 'ms, sample=' + SAMPLE_MS + 'ms, samples=' + SAMPLES);
+console.log('Median of ' + SAMPLES + ' samples shown. Spread = (max-min)/median.');
+if (!canGC) console.log('Note: GC not exposed. Results may have higher variance.');
+console.log();
