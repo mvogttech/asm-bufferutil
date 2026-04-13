@@ -1,0 +1,8 @@
+.github/
+.claude/
+test/
+bench/
+docs/
+CONTRIBUTING.md
+CHANGELOG.md
+.gitignore
