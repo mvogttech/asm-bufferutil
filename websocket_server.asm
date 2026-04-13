@@ -150,7 +150,8 @@ _start:
     mov eax, 0x80000001
     cpuid
     test ecx, (1 << 5)              ; LZCNT
-    jnz .detect_done
+    jz  .set_scalar                 ; LZCNT not found → use scalar path
+    jmp .detect_done
 
 .set_scalar:
     mov byte [use_scalar_parse], 1
