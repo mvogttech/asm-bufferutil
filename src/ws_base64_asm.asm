@@ -263,7 +263,9 @@ ws_base64_encode:
     jl   .avx512vbmi_tail
 
     ; ---- Steps 1-4: identical to AVX2 path ----
-    vmovdqu    ymm0, [r12 + r15]
+    ; Same two-load fix: high lane must contain bytes [r15+12..r15+23].
+    vmovdqu     xmm0, [r12 + r15]
+    vinserti128 ymm0, ymm0, [r12 + r15 + 12], 1
     vpshufb    ymm0, ymm0, [b64_shuf]
     vpmaddubsw ymm1, ymm0, [b64_mul_lo]
     vpsrlw     ymm1, ymm1, 10
@@ -328,8 +330,14 @@ ws_base64_encode:
     cmp  rax, 32
     jl   .avx2_tail             ; < 32 bytes left -> flush remainder via scalar
 
-    ; ---- Step 1: Load 32 bytes (24 consumed, 8 overlap with next iter) ----
-    vmovdqu ymm0, [r12 + r15]
+    ; ---- Step 1: Load 24 bytes across two lane-aligned 16-byte loads ----
+    ; VPSHUFB operates per-lane, using indices 0-11 within each 128-bit lane.
+    ; A plain 32-byte load puts groups 4-7 starting at byte 16 (high lane byte 0),
+    ; but groups 4-7 actually start at byte 12, which is still in the low lane.
+    ; Fix: insert [r15+12..r15+27] into the high lane so both lanes have their
+    ; correct 12 input bytes at lane-relative positions 0-11.
+    vmovdqu     xmm0, [r12 + r15]          ; low lane  = global bytes [r15+0..r15+15]
+    vinserti128 ymm0, ymm0, [r12 + r15 + 12], 1 ; high lane = global bytes [r15+12..r15+27]
 
     ; ---- Step 2: Shuffle bytes for 6-bit extraction ----
     vpshufb ymm0, ymm0, [b64_shuf]

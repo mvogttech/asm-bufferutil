@@ -343,9 +343,8 @@ ws_mask:
     and rcx, 127
 
 .m_nt_avx2_tail:
-    SAFE_VZEROUPPER
     sfence
-    jmp .m_avx2_t32             ; handle remainder with existing path
+    jmp .m_avx2_t32             ; ymm0 still holds valid mask; .m_avx2_t32 owns vzeroupper
 
 
     ; ==================== SSE2 ====================
@@ -416,6 +415,8 @@ ws_mask:
     and rcx, 3
     jz .m_ret
 .m_bytes:
+    test rcx, rcx
+    jz .m_ret
     mov al, [rdi]
     xor al, r8b
     mov [rdx], al
@@ -722,9 +723,8 @@ ws_unmask:
     and rcx, 127
 
 .u_nt_avx2_tail:
-    SAFE_VZEROUPPER
     sfence
-    jmp .u_avx2_t32             ; handle remainder with existing path
+    jmp .u_avx2_t32             ; ymm0 still holds valid mask; .u_avx2_t32 owns vzeroupper
 
 
     ; ==================== SSE2 UNMASK ====================
@@ -786,6 +786,8 @@ ws_unmask:
     and rcx, 3
     jz .u_ret
 .u_bytes:
+    test rcx, rcx
+    jz .u_ret
     xor byte [rdi], r8b
     dec rcx
     jz .u_ret
