@@ -62,7 +62,7 @@
           }
         }]
       ],
-      "cflags": ["-Wall", "-O2", "-msha", "-mgfni"],
+      "cflags": ["-Wall", "-O2", "-mssse3", "-msse4.1", "-msha", "-mgfni"],
       "defines": ["NAPI_VERSION=9"]
     }
   ]
