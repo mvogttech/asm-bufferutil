@@ -90,41 +90,53 @@ ws_mask:
     cmp rcx, (1 << 23)          ; >= 8MB → NT path
     jae .m_nt512
 
-    ; 4x unrolled: 256 bytes/iter
+    ; 8x unrolled: 512 bytes/iter
     mov rax, rcx
-    shr rax, 8
+    shr rax, 9
     test rax, rax
     jz .m_512_tail
 
     align 32
-.m_512_256:
-    prefetcht0 [rdi + 1024]
+.m_512_512:
+    prefetcht0 [rdi + 2048]
     vmovdqu64 zmm1, [rdi]
     vmovdqu64 zmm2, [rdi + 64]
     vmovdqu64 zmm3, [rdi + 128]
     vmovdqu64 zmm4, [rdi + 192]
+    vmovdqu64 zmm5, [rdi + 256]
+    vmovdqu64 zmm6, [rdi + 320]
+    vmovdqu64 zmm7, [rdi + 384]
+    vmovdqu64 zmm8, [rdi + 448]
     vpxord zmm1, zmm1, zmm0
     vpxord zmm2, zmm2, zmm0
     vpxord zmm3, zmm3, zmm0
     vpxord zmm4, zmm4, zmm0
+    vpxord zmm5, zmm5, zmm0
+    vpxord zmm6, zmm6, zmm0
+    vpxord zmm7, zmm7, zmm0
+    vpxord zmm8, zmm8, zmm0
     vmovdqu64 [rdx], zmm1
     vmovdqu64 [rdx + 64], zmm2
     vmovdqu64 [rdx + 128], zmm3
     vmovdqu64 [rdx + 192], zmm4
-    add rdi, 256
-    add rdx, 256
+    vmovdqu64 [rdx + 256], zmm5
+    vmovdqu64 [rdx + 320], zmm6
+    vmovdqu64 [rdx + 384], zmm7
+    vmovdqu64 [rdx + 448], zmm8
+    add rdi, 512
+    add rdx, 512
     dec rax
-    jnz .m_512_256
+    jnz .m_512_512
 
-    and rcx, 255
+    and rcx, 511
 
 .m_512_tail:
-    ; Handle remaining 0-255 bytes — full 64-byte chunks, then opmask tail
+    ; Handle remaining 0-511 bytes — full 64-byte chunks, then opmask tail
     test rcx, rcx
     jz .m_512_done
 
     mov rax, rcx
-    shr rax, 6                  ; full 64-byte chunks (0-3)
+    shr rax, 6                  ; full 64-byte chunks (0-7)
     jz .m_512_final
 
 .m_512_full64:
@@ -462,38 +474,51 @@ ws_unmask:
     cmp rcx, (1 << 23)          ; >= 8MB → NT path
     jae .u_nt512
 
+    ; 8x unrolled: 512 bytes/iter
     mov rax, rcx
-    shr rax, 8
+    shr rax, 9
     test rax, rax
     jz .u_512_tail
 
     align 32
-.u_512_256:
-    prefetcht0 [rdi + 1024]
+.u_512_512:
+    prefetcht0 [rdi + 2048]
     vmovdqu64 zmm1, [rdi]
     vmovdqu64 zmm2, [rdi + 64]
     vmovdqu64 zmm3, [rdi + 128]
     vmovdqu64 zmm4, [rdi + 192]
+    vmovdqu64 zmm5, [rdi + 256]
+    vmovdqu64 zmm6, [rdi + 320]
+    vmovdqu64 zmm7, [rdi + 384]
+    vmovdqu64 zmm8, [rdi + 448]
     vpxord zmm1, zmm1, zmm0
     vpxord zmm2, zmm2, zmm0
     vpxord zmm3, zmm3, zmm0
     vpxord zmm4, zmm4, zmm0
+    vpxord zmm5, zmm5, zmm0
+    vpxord zmm6, zmm6, zmm0
+    vpxord zmm7, zmm7, zmm0
+    vpxord zmm8, zmm8, zmm0
     vmovdqu64 [rdi], zmm1
     vmovdqu64 [rdi + 64], zmm2
     vmovdqu64 [rdi + 128], zmm3
     vmovdqu64 [rdi + 192], zmm4
-    add rdi, 256
+    vmovdqu64 [rdi + 256], zmm5
+    vmovdqu64 [rdi + 320], zmm6
+    vmovdqu64 [rdi + 384], zmm7
+    vmovdqu64 [rdi + 448], zmm8
+    add rdi, 512
     dec rax
-    jnz .u_512_256
-    and rcx, 255
+    jnz .u_512_512
+    and rcx, 511
 
 .u_512_tail:
-    ; Handle remaining 0-255 bytes — full 64-byte chunks, then opmask tail
+    ; Handle remaining 0-511 bytes — full 64-byte chunks, then opmask tail
     test rcx, rcx
     jz .u_512_done
 
     mov rax, rcx
-    shr rax, 6                  ; full 64-byte chunks (0-3)
+    shr rax, 6                  ; full 64-byte chunks (0-7)
     jz .u_512_final
 
 .u_512_full64:
