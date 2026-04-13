@@ -11,16 +11,16 @@ permissions:
 
 jobs:
   benchmark:
-    name: Benchmark (Linux x64, Node 22)
+    name: Benchmark (Linux x64, Node 24)
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Node.js 22
+      - name: Set up Node.js 24
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
 
       - name: Install NASM
         run: sudo apt-get install -y nasm
@@ -47,7 +47,7 @@ jobs:
         run: |
           {
             echo 'body<<BENCH_EOF'
-            echo '## Benchmark Results (Linux x64, Node 22)'
+            echo '## Benchmark Results (Linux x64, Node 24)'
             echo ''
             echo '```text'
             cat bench-output.txt
