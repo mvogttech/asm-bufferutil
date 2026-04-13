@@ -24,8 +24,8 @@ section .data
 
 section .text
 
-global cpu_tier
-global cpu_features
+global cpu_tier:data hidden
+global cpu_features:data hidden
 global _init_cpu_features
 
 ; Register allocation across the function:
