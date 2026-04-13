@@ -52,10 +52,9 @@ static napi_value Sha1(napi_env env, napi_callback_info info) {
     napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
     uint8_t *data; size_t dl;
     napi_get_buffer_info(env, argv[0], (void**)&data, &dl);
-    uint8_t hash[20];
-    ws_sha1_ni(data, dl, hash);
-    napi_value result; void *rd;
-    napi_create_buffer_copy(env, 20, hash, &rd, &result);
+    napi_value result; void *hash;
+    napi_create_buffer(env, 20, &hash, &result);
+    ws_sha1_ni(data, dl, (uint8_t *)hash);
     return result;
 }
 
@@ -76,10 +75,10 @@ static napi_value Base64Encode(napi_env env, napi_callback_info info) {
     napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
     uint8_t *data; size_t dl;
     napi_get_buffer_info(env, argv[0], (void**)&data, &dl);
-    uint8_t out[256]; /* max output for our use case */
-    size_t olen = ws_base64_encode(data, dl, out);
-    napi_value result; void *rd;
-    napi_create_buffer_copy(env, olen, out, &rd, &result);
+    size_t max_out = (dl + 2) / 3 * 4;
+    napi_value result; void *out;
+    napi_create_buffer(env, max_out, &out, &result);
+    ws_base64_encode(data, dl, (uint8_t *)out);
     return result;
 }
 

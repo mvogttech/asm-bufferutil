@@ -83,7 +83,7 @@ static void sha1_ni_block(uint32_t state[5], const uint8_t data[64]) {
 
 void ws_sha1_ni(const uint8_t *msg, size_t len, uint8_t out[20]) {
     uint8_t padded[128];
-    memset(padded, 0, 128);
+    memset(padded, 0, len <= 55 ? 64 : 128);
     if (len) memcpy(padded, msg, len);
     padded[len] = 0x80;
     int nblocks;

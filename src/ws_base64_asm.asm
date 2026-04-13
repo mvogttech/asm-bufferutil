@@ -13,9 +13,8 @@
 ;
 ; Dispatch order (fastest-available first):
 ;   1. cpu_tier >= 2 (AVX2)          -> .avx2_path   (24 input bytes -> 32 output chars / iter)
-;   2. cpu_features bit 0 (GFNI)     -> .gfni_path   (12 input bytes -> 16 output chars / iter)
-;   3. cpu_tier >= 1 (SSE2 baseline) -> .sse2_path   (12 input bytes -> 16 output chars / iter)
-;   4. fallback                      -> .scalar_path  ( 3 input bytes ->  4 output chars / iter)
+;   2. cpu_tier >= 1 (SSE2 baseline) -> .sse2_path   (12 input bytes -> 16 output chars / iter)
+;   3. fallback                      -> .scalar_path  ( 3 input bytes ->  4 output chars / iter)
 ;
 ; Algorithm: Klomp/Muła VPSHUFB method (vectorised base64 encoding)
 ;
@@ -104,7 +103,6 @@ BITS 64
 DEFAULT REL
 
 extern cpu_tier
-extern cpu_features
 
 ; ============================================================================
 ; .data — lookup tables and broadcast constant vectors
@@ -186,29 +184,6 @@ section .data
     b64_const_p03:  times 32 db 3      ; +3  correction ('+'->'/' boundary)
 
     ; -------------------------------------------------------------------------
-    ; GFNI affine matrix constant.
-    ;
-    ; GF2P8AFFINEQB dst, src, imm8 computes for each byte b in src:
-    ;   dst_byte = GF2P8_affine(matrix_qword, b) XOR imm8
-    ; where the matrix is broadcast from the 64-bit constant in src2/memory
-    ; (the same 8-byte matrix is applied to every byte).
-    ;
-    ; NOTE: The matrix 0x4142404341424043 is a placeholder.  A single affine
-    ; transform cannot exactly reproduce the full base64 alphabet mapping because
-    ; the mapping is piecewise linear (different linear maps for each of the 5
-    ; character ranges).  The GFNI path in this file therefore uses the standard
-    ; PSHUFB+PMADDUBSW extraction (same as SSE2) and then uses GF2P8AFFINEQB
-    ; only for blocks where ALL 16 indices are in the uppercase range (0..25),
-    ; for which the affine correctly produces 'A'..'Z'.  All other blocks fall
-    ; through to the scalar path.  This is intentionally conservative: a
-    ; production encoder could use multiple GFNI ops + blends to handle all
-    ; ranges, but that is beyond the scope of this implementation.
-    align 16
-    b64_gfni_matrix:
-        dq 0x4142404341424043
-        dq 0x4142404341424043
-
-    ; -------------------------------------------------------------------------
     ; Standard 64-character base64 alphabet (RFC 4648 §4).
     align 64
     b64_table:
@@ -243,15 +218,12 @@ ws_base64_encode:
 
     ; ------------------------------------------------------------------
     ; Dispatch: fastest available tier first.
-    ; Note: cpu_tier and cpu_features are 32-bit dwords in .data of ws_cpu.asm
-    ; and are declared extern above.  We use RIP-relative addressing
+    ; Note: cpu_tier is a 32-bit dword in .data of ws_cpu.asm
+    ; and is declared extern above.  We use RIP-relative addressing
     ; (DEFAULT REL ensures this).
     ; ------------------------------------------------------------------
     cmp  dword [cpu_tier], 2
     jge  .avx2_path
-
-    test dword [cpu_features], 1    ; bit 0 = GFNI
-    jnz  .gfni_path
 
     cmp  dword [cpu_tier], 1
     jge  .sse2_path
@@ -281,6 +253,9 @@ ws_base64_encode:
     ; Preload per-iteration constants into caller-saved YMM registers.
     ; ymm10..ymm15 hold the threshold/offset vectors and are not clobbered
     ; within the loop body (ymm0..ymm5 are used as scratch).
+    vmovdqa ymm6,  [b64_const_n75]
+    vmovdqa ymm7,  [b64_const_n15]
+    vmovdqa ymm8,  [b64_const_p03]
     vmovdqa ymm10, [b64_const_25]
     vmovdqa ymm11, [b64_const_51]
     vmovdqa ymm12, [b64_const_61]
@@ -325,17 +300,17 @@ ws_base64_encode:
 
     ; -75 where index > 51 (enters digit range)
     vpcmpgtb   ymm5, ymm3, ymm11
-    vpand      ymm5, ymm5, [b64_const_n75]
+    vpand      ymm5, ymm5, ymm6          ; ymm6 = -75
     vpaddb     ymm4, ymm4, ymm5
 
     ; -15 where index > 61 ('+' character, ASCII 43)
     vpcmpgtb   ymm5, ymm3, ymm12
-    vpand      ymm5, ymm5, [b64_const_n15]
+    vpand      ymm5, ymm5, ymm7          ; ymm7 = -15
     vpaddb     ymm4, ymm4, ymm5
 
     ; +3 where index > 62 ('/' character, ASCII 47)
     vpcmpgtb   ymm5, ymm3, ymm13
-    vpand      ymm5, ymm5, [b64_const_p03]
+    vpand      ymm5, ymm5, ymm8          ; ymm8 = +3
     vpaddb     ymm4, ymm4, ymm5
 
     ; ---- Step 6: Map — add offset to index to get ASCII ----
@@ -357,90 +332,6 @@ ws_base64_encode:
 
 
 ; ============================================================================
-; GFNI PATH — 12 input bytes -> 16 output characters per iteration
-;
-; Hardware with GFNI (cpu_features bit 0) can use GF2P8AFFINEQB for fast
-; GF(2^8) affine transforms.  This path extracts 6-bit indices with the same
-; PSHUFB+PMADDUBSW method as the SSE2 path, then uses GF2P8AFFINEQB to map
-; indices to ASCII.
-;
-; Limitation: the affine matrix 0x4142404341424043 maps indices 0..25
-; correctly to 'A'..'Z' but produces incorrect results for other ranges.
-; Rather than produce wrong output, we validate each block: if all 16 indices
-; are in 0..25 we store the GFNI result; otherwise we fall to scalar for those
-; bytes.  This is conservative but correct.  See data comment for b64_gfni_matrix.
-;
-; Note: ptest (used for the "any lane set?" check) is SSE4.1.  Since GFNI
-; requires Ice Lake or newer, SSE4.1 is always available on GFNI-capable CPUs.
-; ============================================================================
-    align 16
-.gfni_path:
-    ; Preload XMM constant registers (first 16 bytes of each 32-byte table).
-    movdqa  xmm10, [b64_const_25]
-    movdqa  xmm11, [b64_const_51]
-    movdqa  xmm12, [b64_const_61]
-    movdqa  xmm13, [b64_const_62]
-    movdqa  xmm14, [b64_const_p65]
-    movdqa  xmm15, [b64_const_p06]
-    movdqu  xmm9,  [b64_gfni_matrix]
-
-    align 16
-.gfni_loop:
-    ; Guard: need 16 bytes for a safe load (consume 12).
-    mov  rax, r13
-    sub  rax, r15
-    cmp  rax, 16
-    jl   .gfni_tail
-
-    ; ---- Steps 1-4: index extraction (identical to SSE2 path) ----
-    movdqu    xmm0, [r12 + r15]
-    pshufb    xmm0, [b64_shuf]
-
-    movdqa    xmm1, xmm0
-    pmaddubsw xmm1, [b64_mul_lo]
-    psrlw     xmm1, 10
-
-    movdqa    xmm2, xmm0
-    pmaddubsw xmm2, [b64_mul_hi]
-    pand      xmm2, [b64_mask3f]
-
-    packuswb  xmm1, xmm2
-    pshufb    xmm1, [b64_pack_shuf]
-
-    ; xmm1 = 16 six-bit indices.  Save for the range check.
-    movdqa    xmm7, xmm1
-
-    ; ---- GFNI transform: map indices to ASCII ----
-    ; GF2P8AFFINEQB xmm_dst, xmm_src/mem, imm8
-    ;   Each byte of dst = affine(matrix_broadcast, corresponding byte of src) XOR imm8
-    ; The matrix is loaded from memory (8 bytes, broadcast internally by hardware).
-    ; imm8 = 0 (no additional XOR bias).
-    gf2p8affineqb xmm1, [b64_gfni_matrix], 0
-
-    ; ---- Validate: only store if all 16 indices are in 0..25 ----
-    ; Check whether any index in the saved copy (xmm7) is > 25.
-    movdqa    xmm6, xmm7
-    pcmpgtb   xmm6, xmm10          ; 0xFF for each byte where index > 25
-    ptest     xmm6, xmm6           ; sets ZF=1 if result is all-zero
-    jnz       .gfni_scalar_block   ; at least one index > 25: fall to scalar
-
-    ; All indices in 0..25: GFNI result is correct, store it.
-    movdqu    [r14 + rbx], xmm1
-
-    add  r15, 12
-    add  rbx, 16
-    jmp  .gfni_loop
-
-.gfni_scalar_block:
-    ; This block contains indices outside the uppercase range.
-    ; Fall through to scalar to process remaining bytes safely.
-    jmp  .scalar_path
-
-.gfni_tail:
-    jmp  .scalar_path
-
-
-; ============================================================================
 ; SSE2 PATH — 12 input bytes -> 16 output characters per iteration
 ;
 ; Uses SSSE3 PSHUFB and SSE2 PMADDUBSW/PACKUSWB/PADDB/PCMPGTB/PAND.
@@ -453,6 +344,9 @@ ws_base64_encode:
     align 16
 .sse2_path:
     ; Preload XMM constants.
+    movdqa  xmm6,  [b64_const_n75]
+    movdqa  xmm7,  [b64_const_n15]
+    movdqa  xmm8,  [b64_const_p03]
     movdqa  xmm10, [b64_const_25]
     movdqa  xmm11, [b64_const_51]
     movdqa  xmm12, [b64_const_61]
@@ -500,19 +394,19 @@ ws_base64_encode:
     ; -75 where index > 51
     movdqa    xmm5, xmm1
     pcmpgtb   xmm5, xmm11
-    pand      xmm5, [b64_const_n75]
+    pand      xmm5, xmm6            ; xmm6 = -75
     paddb     xmm4, xmm5
 
     ; -15 where index > 61
     movdqa    xmm5, xmm1
     pcmpgtb   xmm5, xmm12
-    pand      xmm5, [b64_const_n15]
+    pand      xmm5, xmm7            ; xmm7 = -15
     paddb     xmm4, xmm5
 
     ; +3 where index > 62
     movdqa    xmm5, xmm1
     pcmpgtb   xmm5, xmm13
-    pand      xmm5, [b64_const_p03]
+    pand      xmm5, xmm8            ; xmm8 = +3
     paddb     xmm4, xmm5
 
     ; ---- Step 6: Map index -> ASCII ----
