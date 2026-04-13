@@ -10,6 +10,13 @@
         ["OS!='linux' or target_arch!='x64'", {
           "sources": ["src/ws_fallback.c"]
         }],
+        ["OS=='win'", {
+          "msvs_settings": {
+            "VCCLCompilerTool": {
+              "AdditionalOptions": ["/arch:AVX2"]
+            }
+          }
+        }],
         ["OS=='linux' and target_arch=='x64'", {
           "actions": [
             {
@@ -56,7 +63,7 @@
         }]
       ],
       "cflags": ["-Wall", "-O2", "-msha", "-mgfni"],
-      "defines": ["NAPI_VERSION=8"]
+      "defines": ["NAPI_VERSION=9"]
     }
   ]
 }

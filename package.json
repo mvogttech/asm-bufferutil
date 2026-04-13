@@ -3,14 +3,26 @@
   "version": "0.1.0",
   "description": "WebSocket buffer utils with hand-written x86-64 assembly (SSE2 SIMD) — drop-in replacement for bufferutil",
   "main": "index.js",
-  "files": ["src/", "index.js", "binding.gyp"],
+  "files": [
+    "src/",
+    "index.js",
+    "binding.gyp"
+  ],
   "scripts": {
     "install": "node-gyp rebuild",
     "build": "node-gyp rebuild",
     "test": "node test/index.js",
     "bench": "node bench/index.js"
   },
-  "keywords": ["websocket", "bufferutil", "simd", "asm", "napi", "performance", "x86-64"],
+  "keywords": [
+    "websocket",
+    "bufferutil",
+    "simd",
+    "asm",
+    "napi",
+    "performance",
+    "x86-64"
+  ],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/mvogttech/asm-bufferutil.git"
@@ -20,12 +32,20 @@
   },
   "homepage": "https://github.com/mvogttech/asm-bufferutil#readme",
   "dependencies": {
-    "node-gyp": "^10.0.0"
+    "node-gyp": "^12.0.0"
   },
   "engines": {
-    "node": ">=16.0.0"
+    "node": ">=20.0.0"
   },
-  "os": ["linux", "win32"],
-  "cpu": ["x64"],
-  "license": "MIT"
+  "os": [
+    "linux",
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "bufferutil": "^4.1.0"
+  }
 }
