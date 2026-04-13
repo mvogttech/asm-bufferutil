@@ -3,7 +3,7 @@
     {
       "target_name": "asm_bufferutil",
       "sources": [
-        "src/ws_napi.c",
+        "src/ws_fast_api.cc",
         "src/ws_sha1_ni.c"
       ],
       "conditions": [
