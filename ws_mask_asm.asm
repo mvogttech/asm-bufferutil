@@ -1,11 +1,10 @@
 ; ============================================================================
-; ws_ultimate.asm — WebSocket Acceleration with Modern x86 Instructions
+; ws_mask_asm.asm — WebSocket Masking/Unmasking + Header Search
 ;
 ; Implements:
 ;   1. ws_mask / ws_unmask — AVX-512 + opmask tail (zero branches)
+;                            NT-store path for payloads >= 256KB
 ;   2. ws_find_header     — PCMPISTRI substring search (SSE4.2)
-;   3. ws_base64_encode   — VPSHUFB parallel lookup (AVX2/AVX-512)
-;   4. _init_cpu_features — CPUID tiered detection
 ;
 ; Key instructions utilized:
 ;   VPBROADCASTD r8d     — GPR→ZMM broadcast (AVX-512F)
@@ -13,110 +12,21 @@
 ;   vmovdqu8 {k1}        — opmask masked load/store (AVX-512BW)
 ;   KMOVQ k1, rax        — load opmask from GPR (AVX-512BW)
 ;   PCMPISTRI xmm, m, im — string comparison (SSE4.2)
-;   VPSHUFB zmm          — parallel byte shuffle/lookup (AVX-512BW)
-;   VPTERNLOGD imm8      — ternary bitwise logic (AVX-512F)
 ;   PREFETCHNTA          — non-temporal prefetch
+;   VMOVNTDQ             — non-temporal store (cache-bypass)
 ;   REP MOVSB            — fast memcpy (ERMS/FSRM)
 ;
 ; Build:
-;   nasm -f elf64 ws_ultimate.asm -o ws_ultimate.o
+;   nasm -f elf64 ws_mask_asm.asm -o ws_mask_asm.o
 ; ============================================================================
 
 BITS 64
 DEFAULT REL
 
-section .data
-    align 4
-    cpu_tier: dd 0              ; 0=scalar, 1=SSE2, 2=AVX2, 3=AVX-512
-
-    ; ---- Base64 lookup constants ----
-    align 64
-    ; Offset table for VPSHUFB-based Base64 encoding
-    ; Maps range index → offset to add to 6-bit value to get ASCII
-    ; Range 0: 0-25  → +'A'(65)  offset=65
-    ; Range 1: 26-51 → +'a'(97)  offset=71 (97-26)
-    ; Range 2: 52-61 → +'0'(48)  offset=-4 (48-52)
-    ; Range 3: 62    → '+'(43)   offset=-19 (43-62)
-    ; Range 4: 63    → '/'(47)   offset=-16 (47-63)
-    b64_offset_lut:
-        db 65, 71, -4, -19, -16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
-        db 65, 71, -4, -19, -16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
-
-    ; Shuffle mask to rearrange 3-byte groups → 4 base64 indices
-    ; Input:  [A B C ...] (3 bytes per group)
-    ; Output: 6-bit indices after shift/mask operations
-    align 32
-    b64_shuffle_input:
-        db 1,0,2,1, 4,3,5,4, 7,6,8,7, 10,9,11,10
-        db 1,0,2,1, 4,3,5,4, 7,6,8,7, 10,9,11,10
-
-    ; Multishift amounts for extracting 6-bit fields
-    align 32
-    b64_multishift:
-        db 10,4,22,16, 10,4,22,16, 10,4,22,16, 10,4,22,16
-        db 10,4,22,16, 10,4,22,16, 10,4,22,16, 10,4,22,16
-
-    ; Padding character
-    b64_pad: db '='
-
-    ; Standard Base64 table (fallback)
-    align 64
-    b64_table: db "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-
+extern cpu_tier
+extern cpu_features
 
 section .text
-
-; ============================================================================
-; _init_cpu_features — Detect highest SIMD tier
-; ============================================================================
-global _init_cpu_features
-_init_cpu_features:
-    push rbx
-
-    mov dword [cpu_tier], 1     ; SSE2 baseline
-
-    xor eax, eax
-    cpuid
-    cmp eax, 7
-    jl .det_done
-
-    ; Check OSXSAVE
-    mov eax, 1
-    cpuid
-    test ecx, (1 << 27)
-    jz .det_done
-
-    ; Check XCR0 for YMM (bits 1+2)
-    xor ecx, ecx
-    xgetbv
-    mov r8d, eax
-    and eax, 0x06
-    cmp eax, 0x06
-    jne .det_done
-
-    ; AVX2: CPUID.7:EBX bit 5
-    mov eax, 7
-    xor ecx, ecx
-    cpuid
-    test ebx, (1 << 5)
-    jz .det_done
-    mov dword [cpu_tier], 2
-
-    ; AVX-512: XCR0 bits 5+6+7 + CPUID.7:EBX bits 16+30
-    mov eax, r8d
-    and eax, 0xE0
-    cmp eax, 0xE0
-    jne .det_done
-    test ebx, (1 << 16)        ; AVX-512F
-    jz .det_done
-    test ebx, (1 << 30)        ; AVX-512BW
-    jz .det_done
-    mov dword [cpu_tier], 3
-
-.det_done:
-    pop rbx
-    ret
-
 
 ; ============================================================================
 ; ws_mask(source, mask_ptr, output, offset, length)
@@ -145,6 +55,9 @@ ws_mask:
     align 32
 .m_avx512:
     vpbroadcastd zmm0, r8d
+
+    cmp rcx, (1 << 18)          ; >= 256KB → NT path
+    jae .m_nt512
 
     ; 4x unrolled: 256 bytes/iter
     mov rax, rcx
@@ -242,11 +155,65 @@ ws_mask:
     ret
 
 
+    ; ==================== AVX-512 NT-STORE PATH (>= 256KB) ====================
+    align 32
+.m_nt512:
+    ; Align destination (rdx) to 64-byte boundary using regular stores
+    mov rax, rdx
+    and rax, 63                 ; bytes to process before alignment
+    jz  .m_nt512_aligned
+
+.m_nt512_prologue:
+    mov r9b, [rdi]
+    xor r9b, r8b
+    mov [rdx], r9b
+    inc rdi
+    inc rdx
+    sub rcx, 1
+    sub rax, 1
+    jnz .m_nt512_prologue
+
+.m_nt512_aligned:
+    mov rax, rcx
+    shr rax, 8                  ; 256-byte chunks
+    test rax, rax
+    jz  .m_nt512_tail
+
+    align 32
+.m_nt512_loop:
+    prefetchnta [rdi + 1024]
+    vmovdqu64 zmm1, [rdi]
+    vmovdqu64 zmm2, [rdi + 64]
+    vmovdqu64 zmm3, [rdi + 128]
+    vmovdqu64 zmm4, [rdi + 192]
+    vpxord zmm1, zmm1, zmm0
+    vpxord zmm2, zmm2, zmm0
+    vpxord zmm3, zmm3, zmm0
+    vpxord zmm4, zmm4, zmm0
+    vmovntdq [rdx],       zmm1
+    vmovntdq [rdx + 64],  zmm2
+    vmovntdq [rdx + 128], zmm3
+    vmovntdq [rdx + 192], zmm4
+    add rdi, 256
+    add rdx, 256
+    dec rax
+    jnz .m_nt512_loop
+
+    and rcx, 255
+
+.m_nt512_tail:
+    sfence
+    jmp .m_512_tail             ; handle remainder with existing opmask path
+
+
     ; ==================== AVX2 (unchanged from v3) ====================
     align 32
 .m_avx2:
     vmovd xmm0, r8d
     vpbroadcastd ymm0, xmm0
+
+    cmp rcx, (1 << 18)
+    jae .m_nt_avx2
 
     mov rax, rcx
     shr rax, 7
@@ -300,6 +267,58 @@ ws_mask:
 .m_avx2_done:
     vzeroupper
     ret
+
+
+    ; ==================== AVX2 NT-STORE PATH (>= 256KB) ====================
+    align 32
+.m_nt_avx2:
+    ; Align destination to 32-byte boundary
+    mov rax, rdx
+    and rax, 31
+    jz  .m_nt_avx2_aligned
+
+.m_nt_avx2_prologue:
+    mov r9b, [rdi]
+    xor r9b, r8b
+    mov [rdx], r9b
+    inc rdi
+    inc rdx
+    sub rcx, 1
+    sub rax, 1
+    jnz .m_nt_avx2_prologue
+
+.m_nt_avx2_aligned:
+    mov rax, rcx
+    shr rax, 7                  ; 128-byte chunks
+    test rax, rax
+    jz  .m_nt_avx2_tail
+
+    align 32
+.m_nt_avx2_loop:
+    prefetchnta [rdi + 512]
+    vmovdqu ymm1, [rdi]
+    vmovdqu ymm2, [rdi + 32]
+    vmovdqu ymm3, [rdi + 64]
+    vmovdqu ymm4, [rdi + 96]
+    vpxor ymm1, ymm1, ymm0
+    vpxor ymm2, ymm2, ymm0
+    vpxor ymm3, ymm3, ymm0
+    vpxor ymm4, ymm4, ymm0
+    vmovntdq [rdx],      ymm1
+    vmovntdq [rdx + 32], ymm2
+    vmovntdq [rdx + 64], ymm3
+    vmovntdq [rdx + 96], ymm4
+    add rdi, 128
+    add rdx, 128
+    dec rax
+    jnz .m_nt_avx2_loop
+
+    and rcx, 127
+
+.m_nt_avx2_tail:
+    vzeroupper
+    sfence
+    jmp .m_avx2_t32             ; handle remainder with existing path
 
 
     ; ==================== SSE2 ====================
@@ -409,6 +428,9 @@ ws_unmask:
 .u_avx512:
     vpbroadcastd zmm0, r8d
 
+    cmp rcx, (1 << 18)
+    jae .u_nt512
+
     mov rax, rcx
     shr rax, 8
     test rax, rax
@@ -486,11 +508,61 @@ ws_unmask:
     vzeroupper
     ret
 
+
+    ; ==================== AVX-512 UNMASK NT PATH ====================
+    align 32
+.u_nt512:
+    mov rax, rdi
+    and rax, 63
+    jz  .u_nt512_aligned
+
+.u_nt512_prologue:
+    xor byte [rdi], r8b
+    inc rdi
+    sub rcx, 1
+    sub rax, 1
+    jnz .u_nt512_prologue
+
+.u_nt512_aligned:
+    mov rax, rcx
+    shr rax, 8
+    test rax, rax
+    jz  .u_nt512_tail
+
+    align 32
+.u_nt512_loop:
+    prefetchnta [rdi + 1024]
+    vmovdqu64 zmm1, [rdi]
+    vmovdqu64 zmm2, [rdi + 64]
+    vmovdqu64 zmm3, [rdi + 128]
+    vmovdqu64 zmm4, [rdi + 192]
+    vpxord zmm1, zmm1, zmm0
+    vpxord zmm2, zmm2, zmm0
+    vpxord zmm3, zmm3, zmm0
+    vpxord zmm4, zmm4, zmm0
+    vmovntdq [rdi],       zmm1
+    vmovntdq [rdi + 64],  zmm2
+    vmovntdq [rdi + 128], zmm3
+    vmovntdq [rdi + 192], zmm4
+    add rdi, 256
+    dec rax
+    jnz .u_nt512_loop
+
+    and rcx, 255
+
+.u_nt512_tail:
+    sfence
+    jmp .u_512_tail
+
+
     ; ==================== AVX2 UNMASK ====================
     align 32
 .u_avx2:
     vmovd xmm0, r8d
     vpbroadcastd ymm0, xmm0
+
+    cmp rcx, (1 << 18)
+    jae .u_nt_avx2
 
     mov rax, rcx
     shr rax, 7
@@ -540,6 +612,55 @@ ws_unmask:
 .u_avx2_done:
     vzeroupper
     ret
+
+
+    ; ==================== AVX2 UNMASK NT PATH ====================
+    align 32
+.u_nt_avx2:
+    ; Align destination to 32-byte boundary
+    mov rax, rdi
+    and rax, 31
+    jz  .u_nt_avx2_aligned
+
+.u_nt_avx2_prologue:
+    xor byte [rdi], r8b
+    inc rdi
+    sub rcx, 1
+    sub rax, 1
+    jnz .u_nt_avx2_prologue
+
+.u_nt_avx2_aligned:
+    mov rax, rcx
+    shr rax, 7                  ; 128-byte chunks
+    test rax, rax
+    jz  .u_nt_avx2_tail
+
+    align 32
+.u_nt_avx2_loop:
+    prefetchnta [rdi + 512]
+    vmovdqu ymm1, [rdi]
+    vmovdqu ymm2, [rdi + 32]
+    vmovdqu ymm3, [rdi + 64]
+    vmovdqu ymm4, [rdi + 96]
+    vpxor ymm1, ymm1, ymm0
+    vpxor ymm2, ymm2, ymm0
+    vpxor ymm3, ymm3, ymm0
+    vpxor ymm4, ymm4, ymm0
+    vmovntdq [rdi],      ymm1
+    vmovntdq [rdi + 32], ymm2
+    vmovntdq [rdi + 64], ymm3
+    vmovntdq [rdi + 96], ymm4
+    add rdi, 128
+    dec rax
+    jnz .u_nt_avx2_loop
+
+    and rcx, 127
+
+.u_nt_avx2_tail:
+    vzeroupper
+    sfence
+    jmp .u_avx2_t32             ; handle remainder with existing path
+
 
     ; ==================== SSE2 UNMASK ====================
     align 32
@@ -722,218 +843,6 @@ ws_find_header:
     pop r12
     pop rbx
     ret
-
-
-; ============================================================================
-; ws_base64_encode — Base64 encode using VPSHUFB parallel lookup
-;
-; C: size_t ws_base64_encode(const uint8_t *in, size_t len, uint8_t *out);
-;
-; For SHA-1 output: 20 bytes in → 28 bytes out (with padding)
-; Uses VPSHUFB for parallel 6-bit → ASCII conversion
-;
-; rdi=input  rsi=length  rdx=output
-; Returns: output length in rax
-; ============================================================================
-global ws_base64_encode
-ws_base64_encode:
-    push rbx
-    push r12
-    push r13
-    push r14
-    push r15
-
-    mov r12, rdi                ; input
-    mov r13, rsi                ; length
-    mov r14, rdx                ; output
-    xor r15, r15                ; output index
-
-    ; Process 3 bytes at a time (3 input → 4 output)
-    ; For 20 bytes: 6 full groups (18 bytes) + 2 remaining bytes
-    mov rbx, r13
-    xor rdx, rdx
-    mov rax, rbx
-    mov rcx, 3
-    div rcx                     ; rax = full groups, rdx = remainder
-    mov rcx, rax                ; rcx = number of 3-byte groups
-
-    ; Check if we can use SIMD (need at least 12 bytes = 4 groups)
-    cmp rcx, 4
-    jl .b64_scalar
-
-    ; --- VPSHUFB-accelerated Base64 (process 12 bytes → 16 chars) ---
-    ; This uses the reshuffle technique:
-    ; 1. Load 12 input bytes
-    ; 2. Shuffle to position for 6-bit extraction
-    ; 3. Use multiply+shift to extract 6-bit fields
-    ; 4. Use VPSHUFB for range-based lookup to ASCII
-    ;
-    ; For 20 bytes of SHA-1, we do one pass of 12 bytes + scalar for rest
-    
-    movdqu xmm5, [b64_shuffle_input]   ; shuffle control
-
-    ; Load 12 input bytes (we load 16, ignore last 4)
-    movdqu xmm0, [r12]
-
-    ; Reshuffle: group every 3 bytes into 4 positions for 6-bit extract
-    pshufb xmm0, xmm5          ; rearrange bytes into extract pattern
-
-    ; Extract 6-bit fields using shifts and masks
-    ; Each 3-byte group ABC becomes 4 indices:
-    ;   [A>>2, ((A&3)<<4)|(B>>4), ((B&15)<<2)|(C>>6), C&63]
-    movdqa xmm1, xmm0
-    movdqa xmm2, xmm0
-
-    ; Shift and mask operations to extract 6-bit values
-    psrld xmm1, 2              ; partial shifts
-    pand xmm1, [rel .b64_mask6]
-    psrld xmm2, 4
-    pand xmm2, [rel .b64_mask6]
-
-    ; This gets complex in SSE — for the SHA-1 use case (20 bytes),
-    ; the scalar loop is actually fast enough. Let's use it with
-    ; the VPSHUFB lookup at the end.
-    jmp .b64_scalar
-
-.b64_scalar:
-    ; Standard 3→4 scalar encoding with table lookup
-    xor rcx, rcx                ; input index
-
-.b64_loop:
-    lea rax, [rcx + 3]
-    cmp rax, r13
-    jg .b64_remainder
-
-    ; Load 3 bytes
-    movzx eax, byte [r12 + rcx]
-    shl eax, 16
-    movzx ebx, byte [r12 + rcx + 1]
-    shl ebx, 8
-    or eax, ebx
-    movzx ebx, byte [r12 + rcx + 2]
-    or eax, ebx
-
-    ; Extract 4 six-bit indices and lookup
-    mov ebx, eax
-    shr ebx, 18
-    and ebx, 0x3F
-    lea r10, [rel b64_table]
-    movzx ebx, byte [r10 + rbx]
-    mov [r14 + r15], bl
-    inc r15
-
-    mov ebx, eax
-    shr ebx, 12
-    and ebx, 0x3F
-    lea r10, [rel b64_table]
-    movzx ebx, byte [r10 + rbx]
-    mov [r14 + r15], bl
-    inc r15
-
-    mov ebx, eax
-    shr ebx, 6
-    and ebx, 0x3F
-    lea r10, [rel b64_table]
-    movzx ebx, byte [r10 + rbx]
-    mov [r14 + r15], bl
-    inc r15
-
-    and eax, 0x3F
-    lea r10, [rel b64_table]
-    movzx eax, byte [r10 + rax]
-    mov [r14 + r15], al
-    inc r15
-
-    add rcx, 3
-    jmp .b64_loop
-
-.b64_remainder:
-    ; Handle 0, 1, or 2 remaining bytes
-    mov rax, r13
-    sub rax, rcx
-    cmp rax, 0
-    je .b64_done
-
-    cmp rax, 1
-    je .b64_pad2
-
-    ; 2 remaining bytes → 3 output chars + 1 pad
-    movzx eax, byte [r12 + rcx]
-    shl eax, 16
-    movzx ebx, byte [r12 + rcx + 1]
-    shl ebx, 8
-    or eax, ebx
-
-    mov ebx, eax
-    shr ebx, 18
-    and ebx, 0x3F
-    lea r10, [rel b64_table]
-    movzx ebx, byte [r10 + rbx]
-    mov [r14 + r15], bl
-    inc r15
-
-    mov ebx, eax
-    shr ebx, 12
-    and ebx, 0x3F
-    lea r10, [rel b64_table]
-    movzx ebx, byte [r10 + rbx]
-    mov [r14 + r15], bl
-    inc r15
-
-    mov ebx, eax
-    shr ebx, 6
-    and ebx, 0x3F
-    lea r10, [rel b64_table]
-    movzx ebx, byte [r10 + rbx]
-    mov [r14 + r15], bl
-    inc r15
-
-    mov byte [r14 + r15], '='
-    inc r15
-    jmp .b64_done
-
-.b64_pad2:
-    ; 1 remaining byte → 2 output chars + 2 pads
-    movzx eax, byte [r12 + rcx]
-    shl eax, 16
-
-    mov ebx, eax
-    shr ebx, 18
-    and ebx, 0x3F
-    lea r10, [rel b64_table]
-    movzx ebx, byte [r10 + rbx]
-    mov [r14 + r15], bl
-    inc r15
-
-    mov ebx, eax
-    shr ebx, 12
-    and ebx, 0x3F
-    lea r10, [rel b64_table]
-    movzx ebx, byte [r10 + rbx]
-    mov [r14 + r15], bl
-    inc r15
-
-    mov byte [r14 + r15], '='
-    inc r15
-    mov byte [r14 + r15], '='
-    inc r15
-
-.b64_done:
-    mov rax, r15                ; return output length
-
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop rbx
-    ret
-
-; Local data for Base64 SIMD
-section .data
-    align 16
-    .b64_mask6: dd 0x3F3F3F3F, 0x3F3F3F3F, 0x3F3F3F3F, 0x3F3F3F3F
-
-section .text
 
 
 ; Non-executable stack
