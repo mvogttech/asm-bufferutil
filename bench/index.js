@@ -13,7 +13,7 @@ const crypto = require('crypto');
 // Load assembly implementation
 let asmUtil;
 try {
-  asmUtil = require('./build/Release/asm_bufferutil.node');
+  asmUtil = require('../build/Release/asm_bufferutil.node');
   console.log('Using: native assembly (SSE2) addon\n');
 } catch (e) {
   console.log('Native addon not built. Run `npm run build` first.');

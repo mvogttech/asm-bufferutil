@@ -7,7 +7,7 @@
     "install": "node-gyp rebuild",
     "build": "node-gyp rebuild",
     "test": "node test/index.js",
-    "bench": "node bench.js"
+    "bench": "node bench/index.js"
   },
   "dependencies": {
     "node-gyp": "^10.0.0"
