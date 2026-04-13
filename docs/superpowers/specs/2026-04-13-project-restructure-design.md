@@ -72,7 +72,7 @@ asm-bufferutil/
 │   ├── ws_base64_asm.asm       # Base64 (AVX2/GFNI/SSE2/scalar dispatch)
 │   ├── ws_cpu.asm              # CPU feature detection + tier bitmask
 │   ├── ws_crc32_asm.asm        # CRC32 (SSE4.2)
-│   └── websocket_server.asm    # WebSocket server assembly
+│   └── websocket_server.asm    # WebSocket server assembly (purpose TBD — add inline comment during implementation)
 ├── test/
 │   ├── index.js                # Correctness test suite
 │   ├── crc32.c                 # C-level CRC32 harness
