@@ -13,6 +13,7 @@
 ;   bit 2 = BMI2      (CPUID.7.0:EBX[8])
 ;   bit 3 = LZCNT     (CPUID.0x80000001:ECX[5])
 ;   bit 4 = VBMI      (CPUID.7.0:ECX[1], only set when cpu_tier == 3)
+;   bit 5 = AMD vendor (skip vzeroupper — no SSE/AVX transition penalty)
 
 BITS 64
 DEFAULT REL
@@ -45,10 +46,16 @@ _init_cpu_features:
     ; Default = SSE2 baseline
     mov dword [cpu_tier], 1
 
-    ; === Leaf 0: max basic leaf ===
+    ; === Leaf 0: max basic leaf + vendor detection ===
     xor eax, eax
     cpuid
     mov r9d, eax                    ; r9d = max basic leaf
+
+    ; AMD vendor: EBX='Auth' (0x68747541) from "AuthenticAMD"
+    cmp ebx, 0x68747541
+    jne .not_amd
+    or dword [cpu_features], (1 << 5)
+.not_amd:
 
     ; === Leaf 1: OSXSAVE + PCLMULQDQ ===
     mov eax, 1

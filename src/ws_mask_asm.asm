@@ -29,6 +29,15 @@ DEFAULT REL
 extern cpu_tier
 extern cpu_features
 
+; Skip vzeroupper on AMD (no SSE/AVX transition penalty on Zen).
+; On Intel the branch falls through to vzeroupper as normal.
+%macro SAFE_VZEROUPPER 0
+    test dword [cpu_features], (1 << 5)
+    jnz %%skip
+    vzeroupper
+%%skip:
+%endmacro
+
 section .text
 
 ; ============================================================================
@@ -161,7 +170,7 @@ ws_mask:
     vmovdqu8 [rdx]{k1}, zmm1
 
 .m_512_done:
-    vzeroupper
+    SAFE_VZEROUPPER
     ret
 
 
@@ -274,11 +283,11 @@ ws_mask:
     jz .m_avx2_done
 
 .m_avx2_t_scalar:
-    vzeroupper
+    SAFE_VZEROUPPER
     jmp .m_scalar
 
 .m_avx2_done:
-    vzeroupper
+    SAFE_VZEROUPPER
     ret
 
 
@@ -333,7 +342,7 @@ ws_mask:
     and rcx, 127
 
 .m_nt_avx2_tail:
-    vzeroupper
+    SAFE_VZEROUPPER
     sfence
     jmp .m_avx2_t32             ; handle remainder with existing path
 
@@ -542,7 +551,7 @@ ws_unmask:
     vmovdqu8 [rdi]{k1}, zmm1
 
 .u_512_done:
-    vzeroupper
+    SAFE_VZEROUPPER
     ret
 
 
@@ -646,11 +655,11 @@ ws_unmask:
     jz .u_avx2_done
 
 .u_avx2_scalar:
-    vzeroupper
+    SAFE_VZEROUPPER
     jmp .u_scalar
 
 .u_avx2_done:
-    vzeroupper
+    SAFE_VZEROUPPER
     ret
 
 
@@ -701,7 +710,7 @@ ws_unmask:
     and rcx, 127
 
 .u_nt_avx2_tail:
-    vzeroupper
+    SAFE_VZEROUPPER
     sfence
     jmp .u_avx2_t32             ; handle remainder with existing path
 
