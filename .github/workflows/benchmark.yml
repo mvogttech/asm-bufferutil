@@ -1,0 +1,63 @@
+name: Benchmark
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  benchmark:
+    name: Benchmark (Linux x64, Node 22)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install NASM
+        run: sudo apt-get install -y nasm
+
+      - name: Install dependencies
+        run: npm install --ignore-scripts
+
+      - name: Build native addon
+        run: npm run build
+
+      - name: Run benchmark
+        run: npm run bench 2>&1 | tee bench-output.txt
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: bench-output.txt
+          retention-days: 30
+
+      - name: Prepare comment body
+        id: comment
+        if: github.event_name == 'pull_request'
+        run: |
+          {
+            echo 'body<<BENCH_EOF'
+            echo '## Benchmark Results (Linux x64, Node 22)'
+            echo ''
+            echo '```text'
+            cat bench-output.txt
+            echo '```'
+            echo 'BENCH_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Post PR comment
+        if: github.event_name == 'pull_request'
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: benchmark
+          message: ${{ steps.comment.outputs.body }}
