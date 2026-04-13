@@ -3,14 +3,18 @@
  * Provides the symbols assembled by ws_cpu.asm, ws_mask_asm.asm, and
  * ws_base64_asm.asm on Linux x64.  Used on Windows (MSVC) and macOS (Clang).
  *
- * SIMD dispatch (selected once at init, no per-call branches on the hot path):
- *   AVX2  — 8×32-byte XOR per iteration (256 bytes/iter), runtime-detected
- *   SSE2  — 8×16-byte XOR per iteration (128 bytes/iter), always-on for x64
+ * SIMD dispatch (selected once in _init_cpu_features, zero per-call branches):
+ *   AVX2   — 8×32-byte XOR per iteration (256 bytes/iter), runtime-detected
+ *   SSE2   — 8×16-byte XOR per iteration (128 bytes/iter), always-on for x64
  *   scalar — 4-byte uint32_t XOR, handles tails / non-x64 platforms
+ *
+ * ws_mask and ws_unmask both delegate to xor_impl, a function pointer set once
+ * at init time.  This eliminates per-call branches and all SIMD-body duplication
+ * between the two public functions.  Passing src == dst implements in-place XOR.
  *
  * Symbols provided:
  *   cpu_features        — feature bitmask global (matches ws_cpu.asm layout)
- *   _init_cpu_features  — populate cpu_features via CPUID
+ *   _init_cpu_features  — populate cpu_features via CPUID, select xor_impl
  *   ws_mask             — XOR-mask src -> out+offset
  *   ws_unmask           — XOR-unmask buf in place
  *   ws_find_header      — HTTP header substring search
@@ -59,10 +63,157 @@
  */
 uint32_t cpu_features = 0;
 
-/* Set by _init_cpu_features; read by ws_mask / ws_unmask dispatch. */
-static int avx2_available = 0;
+/* ── Internal XOR implementations ────────────────────────────────────────── */
+/*
+ * Signature: (src, dst, mask_ptr, mask32, length)
+ *
+ * ws_mask  calls xor_impl(src, out+offset, mask_ptr, mask32, length)
+ * ws_unmask calls xor_impl(buf, buf,       mask_ptr, mask32, length)
+ *
+ * mask32 is the 4-byte mask loaded via memcpy (endian-safe).
+ * mask_ptr[0..2] are used directly for the 0-3 byte tail.
+ */
+
+static void xor_scalar(const uint8_t *src, uint8_t *dst,
+                        const uint8_t *mask_ptr, uint32_t mask32, size_t length)
+{
+    size_t i = 0;
+    for (; i + 4 <= length; i += 4) {
+        uint32_t v; memcpy(&v, src + i, 4); v ^= mask32; memcpy(dst + i, &v, 4);
+    }
+    if (i < length) { dst[i] = src[i] ^ mask_ptr[0]; i++; }
+    if (i < length) { dst[i] = src[i] ^ mask_ptr[1]; i++; }
+    if (i < length) { dst[i] = src[i] ^ mask_ptr[2]; }
+}
+
+#if HAVE_SSE2
+static void xor_sse2(const uint8_t *src, uint8_t *dst,
+                     const uint8_t *mask_ptr, uint32_t mask32, size_t length)
+{
+    __m128i vmask = _mm_set1_epi32((int)mask32);
+    size_t i = 0;
+
+    /* Main loop — 128 bytes per iteration, prefetch 256 bytes ahead */
+    for (; i + 128 <= length; i += 128) {
+        _mm_prefetch((const char *)(src + i + 256), _MM_HINT_T0);
+        __m128i v0 = _mm_loadu_si128((const __m128i *)(src + i));
+        __m128i v1 = _mm_loadu_si128((const __m128i *)(src + i +  16));
+        __m128i v2 = _mm_loadu_si128((const __m128i *)(src + i +  32));
+        __m128i v3 = _mm_loadu_si128((const __m128i *)(src + i +  48));
+        __m128i v4 = _mm_loadu_si128((const __m128i *)(src + i +  64));
+        __m128i v5 = _mm_loadu_si128((const __m128i *)(src + i +  80));
+        __m128i v6 = _mm_loadu_si128((const __m128i *)(src + i +  96));
+        __m128i v7 = _mm_loadu_si128((const __m128i *)(src + i + 112));
+        v0 = _mm_xor_si128(v0, vmask); v1 = _mm_xor_si128(v1, vmask);
+        v2 = _mm_xor_si128(v2, vmask); v3 = _mm_xor_si128(v3, vmask);
+        v4 = _mm_xor_si128(v4, vmask); v5 = _mm_xor_si128(v5, vmask);
+        v6 = _mm_xor_si128(v6, vmask); v7 = _mm_xor_si128(v7, vmask);
+        _mm_storeu_si128((__m128i *)(dst + i),       v0);
+        _mm_storeu_si128((__m128i *)(dst + i +  16), v1);
+        _mm_storeu_si128((__m128i *)(dst + i +  32), v2);
+        _mm_storeu_si128((__m128i *)(dst + i +  48), v3);
+        _mm_storeu_si128((__m128i *)(dst + i +  64), v4);
+        _mm_storeu_si128((__m128i *)(dst + i +  80), v5);
+        _mm_storeu_si128((__m128i *)(dst + i +  96), v6);
+        _mm_storeu_si128((__m128i *)(dst + i + 112), v7);
+    }
+    /* 4×16 cleanup — 64 bytes */
+    for (; i + 64 <= length; i += 64) {
+        __m128i v0 = _mm_loadu_si128((const __m128i *)(src + i));
+        __m128i v1 = _mm_loadu_si128((const __m128i *)(src + i + 16));
+        __m128i v2 = _mm_loadu_si128((const __m128i *)(src + i + 32));
+        __m128i v3 = _mm_loadu_si128((const __m128i *)(src + i + 48));
+        v0 = _mm_xor_si128(v0, vmask); v1 = _mm_xor_si128(v1, vmask);
+        v2 = _mm_xor_si128(v2, vmask); v3 = _mm_xor_si128(v3, vmask);
+        _mm_storeu_si128((__m128i *)(dst + i),      v0);
+        _mm_storeu_si128((__m128i *)(dst + i + 16), v1);
+        _mm_storeu_si128((__m128i *)(dst + i + 32), v2);
+        _mm_storeu_si128((__m128i *)(dst + i + 48), v3);
+    }
+    /* 1×16 cleanup — 16 bytes */
+    for (; i + 16 <= length; i += 16) {
+        __m128i v0 = _mm_loadu_si128((const __m128i *)(src + i));
+        _mm_storeu_si128((__m128i *)(dst + i), _mm_xor_si128(v0, vmask));
+    }
+    /* Scalar tail — 0-15 bytes */
+    for (; i + 4 <= length; i += 4) {
+        uint32_t v; memcpy(&v, src + i, 4); v ^= mask32; memcpy(dst + i, &v, 4);
+    }
+    if (i < length) { dst[i] = src[i] ^ mask_ptr[0]; i++; }
+    if (i < length) { dst[i] = src[i] ^ mask_ptr[1]; i++; }
+    if (i < length) { dst[i] = src[i] ^ mask_ptr[2]; }
+}
+#endif /* HAVE_SSE2 */
+
+#if HAVE_AVX2
+static void xor_avx2(const uint8_t *src, uint8_t *dst,
+                     const uint8_t *mask_ptr, uint32_t mask32, size_t length)
+{
+    __m256i vmask = _mm256_set1_epi32((int)mask32);
+    size_t i = 0;
+
+    /* Main loop — 256 bytes per iteration, prefetch 512 bytes ahead */
+    for (; i + 256 <= length; i += 256) {
+        _mm_prefetch((const char *)(src + i + 512), _MM_HINT_T0);
+        __m256i v0 = _mm256_loadu_si256((const __m256i *)(src + i));
+        __m256i v1 = _mm256_loadu_si256((const __m256i *)(src + i +  32));
+        __m256i v2 = _mm256_loadu_si256((const __m256i *)(src + i +  64));
+        __m256i v3 = _mm256_loadu_si256((const __m256i *)(src + i +  96));
+        __m256i v4 = _mm256_loadu_si256((const __m256i *)(src + i + 128));
+        __m256i v5 = _mm256_loadu_si256((const __m256i *)(src + i + 160));
+        __m256i v6 = _mm256_loadu_si256((const __m256i *)(src + i + 192));
+        __m256i v7 = _mm256_loadu_si256((const __m256i *)(src + i + 224));
+        v0 = _mm256_xor_si256(v0, vmask); v1 = _mm256_xor_si256(v1, vmask);
+        v2 = _mm256_xor_si256(v2, vmask); v3 = _mm256_xor_si256(v3, vmask);
+        v4 = _mm256_xor_si256(v4, vmask); v5 = _mm256_xor_si256(v5, vmask);
+        v6 = _mm256_xor_si256(v6, vmask); v7 = _mm256_xor_si256(v7, vmask);
+        _mm256_storeu_si256((__m256i *)(dst + i),       v0);
+        _mm256_storeu_si256((__m256i *)(dst + i +  32), v1);
+        _mm256_storeu_si256((__m256i *)(dst + i +  64), v2);
+        _mm256_storeu_si256((__m256i *)(dst + i +  96), v3);
+        _mm256_storeu_si256((__m256i *)(dst + i + 128), v4);
+        _mm256_storeu_si256((__m256i *)(dst + i + 160), v5);
+        _mm256_storeu_si256((__m256i *)(dst + i + 192), v6);
+        _mm256_storeu_si256((__m256i *)(dst + i + 224), v7);
+    }
+    /* 4×32 cleanup — 128 bytes */
+    for (; i + 128 <= length; i += 128) {
+        __m256i v0 = _mm256_loadu_si256((const __m256i *)(src + i));
+        __m256i v1 = _mm256_loadu_si256((const __m256i *)(src + i + 32));
+        __m256i v2 = _mm256_loadu_si256((const __m256i *)(src + i + 64));
+        __m256i v3 = _mm256_loadu_si256((const __m256i *)(src + i + 96));
+        v0 = _mm256_xor_si256(v0, vmask); v1 = _mm256_xor_si256(v1, vmask);
+        v2 = _mm256_xor_si256(v2, vmask); v3 = _mm256_xor_si256(v3, vmask);
+        _mm256_storeu_si256((__m256i *)(dst + i),      v0);
+        _mm256_storeu_si256((__m256i *)(dst + i + 32), v1);
+        _mm256_storeu_si256((__m256i *)(dst + i + 64), v2);
+        _mm256_storeu_si256((__m256i *)(dst + i + 96), v3);
+    }
+    /* 1×32 cleanup — 32 bytes */
+    for (; i + 32 <= length; i += 32) {
+        __m256i v0 = _mm256_loadu_si256((const __m256i *)(src + i));
+        _mm256_storeu_si256((__m256i *)(dst + i), _mm256_xor_si256(v0, vmask));
+    }
+    /* Scalar tail — 0-31 bytes.  i % 4 == 0 (32 is a multiple of 4). */
+    for (; i + 4 <= length; i += 4) {
+        uint32_t v; memcpy(&v, src + i, 4); v ^= mask32; memcpy(dst + i, &v, 4);
+    }
+    if (i < length) { dst[i] = src[i] ^ mask_ptr[0]; i++; }
+    if (i < length) { dst[i] = src[i] ^ mask_ptr[1]; i++; }
+    if (i < length) { dst[i] = src[i] ^ mask_ptr[2]; }
+}
+#endif /* HAVE_AVX2 */
+
+/* xor_impl: set once by _init_cpu_features to the fastest available path.
+ * Defaults to xor_scalar so any call before init is safe. */
+typedef void (*xor_fn_t)(const uint8_t*, uint8_t*, const uint8_t*, uint32_t, size_t);
+static xor_fn_t xor_impl = xor_scalar;
+
+/* ── _init_cpu_features ───────────────────────────────────────────────────── */
 
 void _init_cpu_features(void) {
+    int avx2 = 0;
+
 #if defined(_MSC_VER)
     int info[4];
     __cpuid(info, 0);
@@ -82,7 +233,7 @@ void _init_cpu_features(void) {
             ((_xgetbv(0) & 0x6) == 0x6) &&
             max_leaf >= 7) {
             __cpuidex(info, 7, 0);
-            if (info[1] & (1 << 5)) avx2_available = 1;
+            if (info[1] & (1 << 5)) avx2 = 1;
         }
     }
     __cpuid(info, (int)0x80000000u);
@@ -92,301 +243,55 @@ void _init_cpu_features(void) {
     }
 
 #elif defined(__x86_64__) || defined(__i386__)
-    unsigned int a, b, c, d;
-    if (!__get_cpuid(0, &a, &b, &c, &d)) return;
-    unsigned int max_leaf = a;
+    {
+        unsigned int a, b, c, d;
+        if (__get_cpuid(0, &a, &b, &c, &d)) {
+            unsigned int max_leaf = a;
 
-    if (max_leaf >= 7 && __get_cpuid_count(7, 0, &a, &b, &c, &d)) {
-        if (c & (1u << 8)) cpu_features |= 1;
-        if (b & (1u << 8)) cpu_features |= 4;
-    }
-    if (max_leaf >= 1 && __get_cpuid(1, &a, &b, &c, &d)) {
-        if (c & (1u << 1)) cpu_features |= 2;
+            if (max_leaf >= 7 && __get_cpuid_count(7, 0, &a, &b, &c, &d)) {
+                if (c & (1u << 8)) cpu_features |= 1;
+                if (b & (1u << 8)) cpu_features |= 4;
+            }
+            if (max_leaf >= 1 && __get_cpuid(1, &a, &b, &c, &d)) {
+                if (c & (1u << 1)) cpu_features |= 2;
 
-        if (c & (1u << 27)) {  /* OSXSAVE */
-            unsigned int xcr0;
-            __asm__ volatile ("xgetbv" : "=a"(xcr0) : "c"(0) : "edx");
-            if ((xcr0 & 0x6) == 0x6 &&
-                max_leaf >= 7 &&
-                __get_cpuid_count(7, 0, &a, &b, &c, &d) &&
-                (b & (1u << 5)))
-                avx2_available = 1;
+                if (c & (1u << 27)) {  /* OSXSAVE */
+                    unsigned int xcr0;
+                    __asm__ volatile ("xgetbv" : "=a"(xcr0) : "c"(0) : "edx");
+                    if ((xcr0 & 0x6) == 0x6 &&
+                        max_leaf >= 7 &&
+                        __get_cpuid_count(7, 0, &a, &b, &c, &d) &&
+                        (b & (1u << 5)))
+                        avx2 = 1;
+                }
+            }
+            if (__get_cpuid(0x80000000u, &a, &b, &c, &d) && a >= 0x80000001u)
+                if (__get_cpuid(0x80000001u, &a, &b, &c, &d))
+                    if (c & (1u << 5)) cpu_features |= 8;  /* LZCNT */
         }
     }
-    if (__get_cpuid(0x80000000u, &a, &b, &c, &d) && a >= 0x80000001u)
-        if (__get_cpuid(0x80000001u, &a, &b, &c, &d))
-            if (c & (1u << 5)) cpu_features |= 8;  /* LZCNT */
+#endif
+
+    /* Upgrade xor_impl to fastest available path. */
+#if HAVE_SSE2
+    xor_impl = xor_sse2;
+#endif
+#if HAVE_AVX2
+    if (avx2) xor_impl = xor_avx2;
 #endif
 }
 
-/* ── ws_mask ──────────────────────────────────────────────────────────────── */
+/* ── ws_mask / ws_unmask ──────────────────────────────────────────────────── */
 
 void ws_mask(const uint8_t *src, const uint8_t *mask_ptr,
              uint8_t *out, size_t offset, size_t length) {
-    uint32_t mask32;
-    memcpy(&mask32, mask_ptr, 4);
-    uint8_t *dest = out + offset;
-    size_t i = 0;
-
-/* ---- AVX2 path: 8×32 = 256 bytes/iter ------------------------------------ */
-#if HAVE_AVX2
-    if (avx2_available) {
-        __m256i vmask = _mm256_set1_epi32((int)mask32);
-
-        /* Main loop — 256 bytes per iteration, prefetch 512 bytes ahead */
-        for (; i + 256 <= length; i += 256) {
-            _mm_prefetch((const char *)(src + i + 512), _MM_HINT_T0);
-            __m256i v0 = _mm256_loadu_si256((const __m256i *)(src + i));
-            __m256i v1 = _mm256_loadu_si256((const __m256i *)(src + i +  32));
-            __m256i v2 = _mm256_loadu_si256((const __m256i *)(src + i +  64));
-            __m256i v3 = _mm256_loadu_si256((const __m256i *)(src + i +  96));
-            __m256i v4 = _mm256_loadu_si256((const __m256i *)(src + i + 128));
-            __m256i v5 = _mm256_loadu_si256((const __m256i *)(src + i + 160));
-            __m256i v6 = _mm256_loadu_si256((const __m256i *)(src + i + 192));
-            __m256i v7 = _mm256_loadu_si256((const __m256i *)(src + i + 224));
-            v0 = _mm256_xor_si256(v0, vmask);
-            v1 = _mm256_xor_si256(v1, vmask);
-            v2 = _mm256_xor_si256(v2, vmask);
-            v3 = _mm256_xor_si256(v3, vmask);
-            v4 = _mm256_xor_si256(v4, vmask);
-            v5 = _mm256_xor_si256(v5, vmask);
-            v6 = _mm256_xor_si256(v6, vmask);
-            v7 = _mm256_xor_si256(v7, vmask);
-            _mm256_storeu_si256((__m256i *)(dest + i),       v0);
-            _mm256_storeu_si256((__m256i *)(dest + i +  32), v1);
-            _mm256_storeu_si256((__m256i *)(dest + i +  64), v2);
-            _mm256_storeu_si256((__m256i *)(dest + i +  96), v3);
-            _mm256_storeu_si256((__m256i *)(dest + i + 128), v4);
-            _mm256_storeu_si256((__m256i *)(dest + i + 160), v5);
-            _mm256_storeu_si256((__m256i *)(dest + i + 192), v6);
-            _mm256_storeu_si256((__m256i *)(dest + i + 224), v7);
-        }
-        /* 4×32 cleanup — 128 bytes */
-        for (; i + 128 <= length; i += 128) {
-            __m256i v0 = _mm256_loadu_si256((const __m256i *)(src + i));
-            __m256i v1 = _mm256_loadu_si256((const __m256i *)(src + i + 32));
-            __m256i v2 = _mm256_loadu_si256((const __m256i *)(src + i + 64));
-            __m256i v3 = _mm256_loadu_si256((const __m256i *)(src + i + 96));
-            v0 = _mm256_xor_si256(v0, vmask);
-            v1 = _mm256_xor_si256(v1, vmask);
-            v2 = _mm256_xor_si256(v2, vmask);
-            v3 = _mm256_xor_si256(v3, vmask);
-            _mm256_storeu_si256((__m256i *)(dest + i),      v0);
-            _mm256_storeu_si256((__m256i *)(dest + i + 32), v1);
-            _mm256_storeu_si256((__m256i *)(dest + i + 64), v2);
-            _mm256_storeu_si256((__m256i *)(dest + i + 96), v3);
-        }
-        /* 1×32 cleanup — 32 bytes */
-        for (; i + 32 <= length; i += 32) {
-            __m256i v0 = _mm256_loadu_si256((const __m256i *)(src + i));
-            v0 = _mm256_xor_si256(v0, vmask);
-            _mm256_storeu_si256((__m256i *)(dest + i), v0);
-        }
-        /* Scalar tail — 0-31 bytes. i % 4 == 0 here (32 is a multiple of 4). */
-        for (; i + 4 <= length; i += 4) {
-            uint32_t v; memcpy(&v, src + i, 4); v ^= mask32; memcpy(dest + i, &v, 4);
-        }
-        if (i < length) { dest[i] = src[i] ^ mask_ptr[0]; i++; }
-        if (i < length) { dest[i] = src[i] ^ mask_ptr[1]; i++; }
-        if (i < length) { dest[i] = src[i] ^ mask_ptr[2]; }
-        return;
-    }
-#endif
-
-/* ---- SSE2 path: 8×16 = 128 bytes/iter ------------------------------------ */
-#if HAVE_SSE2
-    {
-        __m128i vmask = _mm_set1_epi32((int)mask32);
-
-        /* Main loop — 128 bytes per iteration, prefetch 256 bytes ahead */
-        for (; i + 128 <= length; i += 128) {
-            _mm_prefetch((const char *)(src + i + 256), _MM_HINT_T0);
-            __m128i v0 = _mm_loadu_si128((const __m128i *)(src + i));
-            __m128i v1 = _mm_loadu_si128((const __m128i *)(src + i +  16));
-            __m128i v2 = _mm_loadu_si128((const __m128i *)(src + i +  32));
-            __m128i v3 = _mm_loadu_si128((const __m128i *)(src + i +  48));
-            __m128i v4 = _mm_loadu_si128((const __m128i *)(src + i +  64));
-            __m128i v5 = _mm_loadu_si128((const __m128i *)(src + i +  80));
-            __m128i v6 = _mm_loadu_si128((const __m128i *)(src + i +  96));
-            __m128i v7 = _mm_loadu_si128((const __m128i *)(src + i + 112));
-            v0 = _mm_xor_si128(v0, vmask);
-            v1 = _mm_xor_si128(v1, vmask);
-            v2 = _mm_xor_si128(v2, vmask);
-            v3 = _mm_xor_si128(v3, vmask);
-            v4 = _mm_xor_si128(v4, vmask);
-            v5 = _mm_xor_si128(v5, vmask);
-            v6 = _mm_xor_si128(v6, vmask);
-            v7 = _mm_xor_si128(v7, vmask);
-            _mm_storeu_si128((__m128i *)(dest + i),       v0);
-            _mm_storeu_si128((__m128i *)(dest + i +  16), v1);
-            _mm_storeu_si128((__m128i *)(dest + i +  32), v2);
-            _mm_storeu_si128((__m128i *)(dest + i +  48), v3);
-            _mm_storeu_si128((__m128i *)(dest + i +  64), v4);
-            _mm_storeu_si128((__m128i *)(dest + i +  80), v5);
-            _mm_storeu_si128((__m128i *)(dest + i +  96), v6);
-            _mm_storeu_si128((__m128i *)(dest + i + 112), v7);
-        }
-        /* 4×16 cleanup — 64 bytes */
-        for (; i + 64 <= length; i += 64) {
-            __m128i v0 = _mm_loadu_si128((const __m128i *)(src + i));
-            __m128i v1 = _mm_loadu_si128((const __m128i *)(src + i + 16));
-            __m128i v2 = _mm_loadu_si128((const __m128i *)(src + i + 32));
-            __m128i v3 = _mm_loadu_si128((const __m128i *)(src + i + 48));
-            v0 = _mm_xor_si128(v0, vmask);
-            v1 = _mm_xor_si128(v1, vmask);
-            v2 = _mm_xor_si128(v2, vmask);
-            v3 = _mm_xor_si128(v3, vmask);
-            _mm_storeu_si128((__m128i *)(dest + i),      v0);
-            _mm_storeu_si128((__m128i *)(dest + i + 16), v1);
-            _mm_storeu_si128((__m128i *)(dest + i + 32), v2);
-            _mm_storeu_si128((__m128i *)(dest + i + 48), v3);
-        }
-        /* 1×16 cleanup — 16 bytes */
-        for (; i + 16 <= length; i += 16) {
-            __m128i v0 = _mm_loadu_si128((const __m128i *)(src + i));
-            v0 = _mm_xor_si128(v0, vmask);
-            _mm_storeu_si128((__m128i *)(dest + i), v0);
-        }
-    }
-#endif
-
-    /* Scalar tail — handles < 16 bytes (SSE2) or all bytes (non-x64) */
-    for (; i + 4 <= length; i += 4) {
-        uint32_t v; memcpy(&v, src + i, 4); v ^= mask32; memcpy(dest + i, &v, 4);
-    }
-    if (i < length) { dest[i] = src[i] ^ mask_ptr[0]; i++; }
-    if (i < length) { dest[i] = src[i] ^ mask_ptr[1]; i++; }
-    if (i < length) { dest[i] = src[i] ^ mask_ptr[2]; }
+    uint32_t mask32; memcpy(&mask32, mask_ptr, 4);
+    xor_impl(src, out + offset, mask_ptr, mask32, length);
 }
 
-/* ── ws_unmask ────────────────────────────────────────────────────────────── */
-
 void ws_unmask(uint8_t *buf, const uint8_t *mask_ptr, size_t length) {
-    uint32_t mask32;
-    memcpy(&mask32, mask_ptr, 4);
-    size_t i = 0;
-
-/* ---- AVX2 path ------------------------------------------------------------ */
-#if HAVE_AVX2
-    if (avx2_available) {
-        __m256i vmask = _mm256_set1_epi32((int)mask32);
-
-        for (; i + 256 <= length; i += 256) {
-            _mm_prefetch((const char *)(buf + i + 512), _MM_HINT_T0);
-            __m256i v0 = _mm256_loadu_si256((const __m256i *)(buf + i));
-            __m256i v1 = _mm256_loadu_si256((const __m256i *)(buf + i +  32));
-            __m256i v2 = _mm256_loadu_si256((const __m256i *)(buf + i +  64));
-            __m256i v3 = _mm256_loadu_si256((const __m256i *)(buf + i +  96));
-            __m256i v4 = _mm256_loadu_si256((const __m256i *)(buf + i + 128));
-            __m256i v5 = _mm256_loadu_si256((const __m256i *)(buf + i + 160));
-            __m256i v6 = _mm256_loadu_si256((const __m256i *)(buf + i + 192));
-            __m256i v7 = _mm256_loadu_si256((const __m256i *)(buf + i + 224));
-            v0 = _mm256_xor_si256(v0, vmask);
-            v1 = _mm256_xor_si256(v1, vmask);
-            v2 = _mm256_xor_si256(v2, vmask);
-            v3 = _mm256_xor_si256(v3, vmask);
-            v4 = _mm256_xor_si256(v4, vmask);
-            v5 = _mm256_xor_si256(v5, vmask);
-            v6 = _mm256_xor_si256(v6, vmask);
-            v7 = _mm256_xor_si256(v7, vmask);
-            _mm256_storeu_si256((__m256i *)(buf + i),       v0);
-            _mm256_storeu_si256((__m256i *)(buf + i +  32), v1);
-            _mm256_storeu_si256((__m256i *)(buf + i +  64), v2);
-            _mm256_storeu_si256((__m256i *)(buf + i +  96), v3);
-            _mm256_storeu_si256((__m256i *)(buf + i + 128), v4);
-            _mm256_storeu_si256((__m256i *)(buf + i + 160), v5);
-            _mm256_storeu_si256((__m256i *)(buf + i + 192), v6);
-            _mm256_storeu_si256((__m256i *)(buf + i + 224), v7);
-        }
-        for (; i + 128 <= length; i += 128) {
-            __m256i v0 = _mm256_loadu_si256((const __m256i *)(buf + i));
-            __m256i v1 = _mm256_loadu_si256((const __m256i *)(buf + i + 32));
-            __m256i v2 = _mm256_loadu_si256((const __m256i *)(buf + i + 64));
-            __m256i v3 = _mm256_loadu_si256((const __m256i *)(buf + i + 96));
-            v0 = _mm256_xor_si256(v0, vmask);
-            v1 = _mm256_xor_si256(v1, vmask);
-            v2 = _mm256_xor_si256(v2, vmask);
-            v3 = _mm256_xor_si256(v3, vmask);
-            _mm256_storeu_si256((__m256i *)(buf + i),      v0);
-            _mm256_storeu_si256((__m256i *)(buf + i + 32), v1);
-            _mm256_storeu_si256((__m256i *)(buf + i + 64), v2);
-            _mm256_storeu_si256((__m256i *)(buf + i + 96), v3);
-        }
-        for (; i + 32 <= length; i += 32) {
-            __m256i v0 = _mm256_loadu_si256((const __m256i *)(buf + i));
-            v0 = _mm256_xor_si256(v0, vmask);
-            _mm256_storeu_si256((__m256i *)(buf + i), v0);
-        }
-        for (; i + 4 <= length; i += 4) {
-            uint32_t v; memcpy(&v, buf + i, 4); v ^= mask32; memcpy(buf + i, &v, 4);
-        }
-        if (i < length) { buf[i] ^= mask_ptr[0]; i++; }
-        if (i < length) { buf[i] ^= mask_ptr[1]; i++; }
-        if (i < length) { buf[i] ^= mask_ptr[2]; }
-        return;
-    }
-#endif
-
-/* ---- SSE2 path ------------------------------------------------------------ */
-#if HAVE_SSE2
-    {
-        __m128i vmask = _mm_set1_epi32((int)mask32);
-
-        for (; i + 128 <= length; i += 128) {
-            _mm_prefetch((const char *)(buf + i + 256), _MM_HINT_T0);
-            __m128i v0 = _mm_loadu_si128((const __m128i *)(buf + i));
-            __m128i v1 = _mm_loadu_si128((const __m128i *)(buf + i +  16));
-            __m128i v2 = _mm_loadu_si128((const __m128i *)(buf + i +  32));
-            __m128i v3 = _mm_loadu_si128((const __m128i *)(buf + i +  48));
-            __m128i v4 = _mm_loadu_si128((const __m128i *)(buf + i +  64));
-            __m128i v5 = _mm_loadu_si128((const __m128i *)(buf + i +  80));
-            __m128i v6 = _mm_loadu_si128((const __m128i *)(buf + i +  96));
-            __m128i v7 = _mm_loadu_si128((const __m128i *)(buf + i + 112));
-            v0 = _mm_xor_si128(v0, vmask);
-            v1 = _mm_xor_si128(v1, vmask);
-            v2 = _mm_xor_si128(v2, vmask);
-            v3 = _mm_xor_si128(v3, vmask);
-            v4 = _mm_xor_si128(v4, vmask);
-            v5 = _mm_xor_si128(v5, vmask);
-            v6 = _mm_xor_si128(v6, vmask);
-            v7 = _mm_xor_si128(v7, vmask);
-            _mm_storeu_si128((__m128i *)(buf + i),       v0);
-            _mm_storeu_si128((__m128i *)(buf + i +  16), v1);
-            _mm_storeu_si128((__m128i *)(buf + i +  32), v2);
-            _mm_storeu_si128((__m128i *)(buf + i +  48), v3);
-            _mm_storeu_si128((__m128i *)(buf + i +  64), v4);
-            _mm_storeu_si128((__m128i *)(buf + i +  80), v5);
-            _mm_storeu_si128((__m128i *)(buf + i +  96), v6);
-            _mm_storeu_si128((__m128i *)(buf + i + 112), v7);
-        }
-        for (; i + 64 <= length; i += 64) {
-            __m128i v0 = _mm_loadu_si128((const __m128i *)(buf + i));
-            __m128i v1 = _mm_loadu_si128((const __m128i *)(buf + i + 16));
-            __m128i v2 = _mm_loadu_si128((const __m128i *)(buf + i + 32));
-            __m128i v3 = _mm_loadu_si128((const __m128i *)(buf + i + 48));
-            v0 = _mm_xor_si128(v0, vmask);
-            v1 = _mm_xor_si128(v1, vmask);
-            v2 = _mm_xor_si128(v2, vmask);
-            v3 = _mm_xor_si128(v3, vmask);
-            _mm_storeu_si128((__m128i *)(buf + i),      v0);
-            _mm_storeu_si128((__m128i *)(buf + i + 16), v1);
-            _mm_storeu_si128((__m128i *)(buf + i + 32), v2);
-            _mm_storeu_si128((__m128i *)(buf + i + 48), v3);
-        }
-        for (; i + 16 <= length; i += 16) {
-            __m128i v0 = _mm_loadu_si128((const __m128i *)(buf + i));
-            v0 = _mm_xor_si128(v0, vmask);
-            _mm_storeu_si128((__m128i *)(buf + i), v0);
-        }
-    }
-#endif
-
-    for (; i + 4 <= length; i += 4) {
-        uint32_t v; memcpy(&v, buf + i, 4); v ^= mask32; memcpy(buf + i, &v, 4);
-    }
-    if (i < length) { buf[i] ^= mask_ptr[0]; i++; }
-    if (i < length) { buf[i] ^= mask_ptr[1]; i++; }
-    if (i < length) { buf[i] ^= mask_ptr[2]; }
+    uint32_t mask32; memcpy(&mask32, mask_ptr, 4);
+    xor_impl(buf, buf, mask_ptr, mask32, length);
 }
 
 /* ── ws_find_header ───────────────────────────────────────────────────────── */
