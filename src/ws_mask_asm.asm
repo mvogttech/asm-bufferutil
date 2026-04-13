@@ -483,23 +483,30 @@ ws_unmask:
     cmp rcx, (1 << 23)          ; >= 8MB → NT path
     jae .u_nt512
 
-    ; 8x unrolled: 512 bytes/iter
+    ; Dual-stream: process 256 bytes from front + 256 from back per iteration.
+    ; Two independent memory streams increase page-level parallelism and
+    ; TLB coverage for large in-place buffers.
     mov rax, rcx
-    shr rax, 9
+    shr rax, 9                  ; iterations = len / 512
     test rax, rax
     jz .u_512_tail
 
+    lea r11, [rdi + rcx - 256]  ; r11 = back pointer (last 256-byte block)
+
     align 32
-.u_512_512:
-    prefetcht0 [rdi + 2048]
+.u_dual_512:
+    prefetcht0 [rdi + 1024]
+    prefetcht0 [r11 - 768]
+    ; Front 256 bytes
     vmovdqu64 zmm1, [rdi]
     vmovdqu64 zmm2, [rdi + 64]
     vmovdqu64 zmm3, [rdi + 128]
     vmovdqu64 zmm4, [rdi + 192]
-    vmovdqu64 zmm5, [rdi + 256]
-    vmovdqu64 zmm6, [rdi + 320]
-    vmovdqu64 zmm7, [rdi + 384]
-    vmovdqu64 zmm8, [rdi + 448]
+    ; Back 256 bytes
+    vmovdqu64 zmm5, [r11]
+    vmovdqu64 zmm6, [r11 + 64]
+    vmovdqu64 zmm7, [r11 + 128]
+    vmovdqu64 zmm8, [r11 + 192]
     vpxord zmm1, zmm1, zmm0
     vpxord zmm2, zmm2, zmm0
     vpxord zmm3, zmm3, zmm0
@@ -512,14 +519,18 @@ ws_unmask:
     vmovdqu64 [rdi + 64], zmm2
     vmovdqu64 [rdi + 128], zmm3
     vmovdqu64 [rdi + 192], zmm4
-    vmovdqu64 [rdi + 256], zmm5
-    vmovdqu64 [rdi + 320], zmm6
-    vmovdqu64 [rdi + 384], zmm7
-    vmovdqu64 [rdi + 448], zmm8
-    add rdi, 512
+    vmovdqu64 [r11], zmm5
+    vmovdqu64 [r11 + 64], zmm6
+    vmovdqu64 [r11 + 128], zmm7
+    vmovdqu64 [r11 + 192], zmm8
+    add rdi, 256
+    sub r11, 256
     dec rax
-    jnz .u_512_512
-    and rcx, 511
+    jnz .u_dual_512
+
+    ; Remaining middle bytes: (r11 + 256) - rdi
+    lea rcx, [r11 + 256]
+    sub rcx, rdi
 
 .u_512_tail:
     ; Handle remaining 0-511 bytes — full 64-byte chunks, then opmask tail
