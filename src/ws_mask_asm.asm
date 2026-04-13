@@ -48,6 +48,34 @@ ws_mask:
 
     mov r8d, [rsi]              ; 4-byte mask
 
+    ; ==================== GPR FAST PATH (< 128 bytes) ====================
+    ; Avoids SIMD setup overhead for small WebSocket frames (control, etc.)
+    cmp rcx, 128
+    jae .m_dispatch_simd
+
+    mov r9, r8                  ; build 8-byte mask: r9 = r8d | (r8d << 32)
+    shl r9, 32
+    or  r9, r8
+
+    mov rax, rcx
+    shr rax, 3                  ; 8-byte chunks
+    test rax, rax
+    jz .m_scalar
+
+.m_gpr8:
+    mov r10, [rdi]
+    xor r10, r9
+    mov [rdx], r10
+    add rdi, 8
+    add rdx, 8
+    dec rax
+    jnz .m_gpr8
+
+    and rcx, 7
+    jz .m_ret
+    jmp .m_scalar
+
+.m_dispatch_simd:
     cmp dword [cpu_tier], 3
     je .m_avx512
     cmp dword [cpu_tier], 2
@@ -394,6 +422,32 @@ ws_unmask:
 
     mov r8d, [rsi]
 
+    ; ==================== GPR FAST PATH (< 128 bytes) ====================
+    cmp rcx, 128
+    jae .u_dispatch_simd
+
+    mov r9, r8
+    shl r9, 32
+    or  r9, r8
+
+    mov rax, rcx
+    shr rax, 3
+    test rax, rax
+    jz .u_scalar
+
+.u_gpr8:
+    mov r10, [rdi]
+    xor r10, r9
+    mov [rdi], r10
+    add rdi, 8
+    dec rax
+    jnz .u_gpr8
+
+    and rcx, 7
+    jz .u_ret
+    jmp .u_scalar
+
+.u_dispatch_simd:
     cmp dword [cpu_tier], 3
     je .u_avx512
     cmp dword [cpu_tier], 2
