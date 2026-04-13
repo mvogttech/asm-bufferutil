@@ -10,6 +10,8 @@
 ;   VPBROADCASTD r8d     — GPR→ZMM broadcast (AVX-512F)
 ;   VPXORD zmm           — integer-domain XOR (AVX-512F)
 ;   vmovdqu8 {k1}        — opmask masked load/store (AVX-512BW)
+;   BZHI rax, rax, rcx   — build tail opmask: lower rcx bits=1, upper=0 (BMI2)
+;                          naturally handles rcx=64 (all-ones) with no branch
 ;   KMOVQ k1, rax        — load opmask from GPR (AVX-512BW)
 ;   PCMPISTRI xmm, m, im — string comparison (SSE4.2)
 ;   PREFETCHNTA          — non-temporal prefetch
@@ -88,67 +90,34 @@ ws_mask:
     and rcx, 255
 
 .m_512_tail:
-    ; Handle remaining 0-255 bytes with opmask — NO scalar fallback needed
-    ; Process up to 4 masked 64-byte chunks
+    ; Handle remaining 0-255 bytes — full 64-byte chunks, then opmask tail
     test rcx, rcx
     jz .m_512_done
 
-    ; Chunk 1: up to 64 bytes
-    cmp rcx, 64
-    jbe .m_512_final           ; last chunk, use mask
+    mov rax, rcx
+    shr rax, 6                  ; full 64-byte chunks (0-3)
+    jz .m_512_final
 
+.m_512_full64:
     vmovdqu64 zmm1, [rdi]
     vpxord zmm1, zmm1, zmm0
     vmovdqu64 [rdx], zmm1
     add rdi, 64
     add rdx, 64
     sub rcx, 64
+    dec rax
+    jnz .m_512_full64
 
-    ; Chunk 2
-    cmp rcx, 64
-    jbe .m_512_final
-
-    vmovdqu64 zmm1, [rdi]
-    vpxord zmm1, zmm1, zmm0
-    vmovdqu64 [rdx], zmm1
-    add rdi, 64
-    add rdx, 64
-    sub rcx, 64
-
-    ; Chunk 3
-    cmp rcx, 64
-    jbe .m_512_final
-
-    vmovdqu64 zmm1, [rdi]
-    vpxord zmm1, zmm1, zmm0
-    vmovdqu64 [rdx], zmm1
-    add rdi, 64
-    add rdx, 64
-    sub rcx, 64
-
-    ; Fall through to final masked chunk
-
-    ; ---- OPMASK TAIL: process exactly rcx remaining bytes (1-64) ----
+    ; ---- OPMASK TAIL: process exactly rcx remaining bytes (0-63) ----
+    ; BZHI with rcx=0 → mask=0 → vmovdqu8{k1=0} is a safe no-op
 .m_512_final:
-    ; Build byte mask: k1 = (1 << rcx) - 1
-    ; For rcx=64 this needs special handling (all ones)
-    cmp rcx, 64
-    je .m_512_final_full
-
-    mov rax, 1
-    shl rax, cl                 ; 1 << rcx
-    dec rax                     ; (1 << rcx) - 1
+    mov rax, -1
+    bzhi rax, rax, rcx
     kmovq k1, rax
 
-    vmovdqu8 zmm1{k1}{z}, [rdi] ; masked load (only rcx bytes)
-    vpxord zmm1, zmm1, zmm0     ; XOR all 64 bytes (extra bytes are zero, harmless)
-    vmovdqu8 [rdx]{k1}, zmm1    ; masked store (only rcx bytes written)
-    jmp .m_512_done
-
-.m_512_final_full:
-    vmovdqu64 zmm1, [rdi]
+    vmovdqu8 zmm1{k1}{z}, [rdi]
     vpxord zmm1, zmm1, zmm0
-    vmovdqu64 [rdx], zmm1
+    vmovdqu8 [rdx]{k1}, zmm1
 
 .m_512_done:
     vzeroupper
@@ -160,18 +129,21 @@ ws_mask:
 .m_nt512:
     ; Align destination (rdx) to 64-byte boundary using regular stores
     mov rax, rdx
-    and rax, 63                 ; bytes to process before alignment
+    neg rax
+    and rax, 63                 ; bytes to next 64-byte boundary: (-rdx) & 63
     jz  .m_nt512_aligned
 
 .m_nt512_prologue:
     mov r9b, [rdi]
     xor r9b, r8b
     mov [rdx], r9b
+    ror r8d, 8                  ; advance to next mask byte
     inc rdi
     inc rdx
     sub rcx, 1
     sub rax, 1
     jnz .m_nt512_prologue
+    vpbroadcastd zmm0, r8d      ; re-sync vector mask to current phase
 
 .m_nt512_aligned:
     mov rax, rcx
@@ -274,18 +246,22 @@ ws_mask:
 .m_nt_avx2:
     ; Align destination to 32-byte boundary
     mov rax, rdx
-    and rax, 31
+    neg rax
+    and rax, 31                 ; bytes to next 32-byte boundary: (-rdx) & 31
     jz  .m_nt_avx2_aligned
 
 .m_nt_avx2_prologue:
     mov r9b, [rdi]
     xor r9b, r8b
     mov [rdx], r9b
+    ror r8d, 8                  ; advance to next mask byte
     inc rdi
     inc rdx
     sub rcx, 1
     sub rax, 1
     jnz .m_nt_avx2_prologue
+    vmovd xmm0, r8d
+    vpbroadcastd ymm0, xmm0     ; re-sync vector mask to current phase
 
 .m_nt_avx2_aligned:
     mov rax, rcx
@@ -457,52 +433,33 @@ ws_unmask:
     and rcx, 255
 
 .u_512_tail:
+    ; Handle remaining 0-255 bytes — full 64-byte chunks, then opmask tail
     test rcx, rcx
     jz .u_512_done
 
-    ; Full 64-byte chunks from remainder
-    cmp rcx, 64
-    jbe .u_512_final
+    mov rax, rcx
+    shr rax, 6                  ; full 64-byte chunks (0-3)
+    jz .u_512_final
+
+.u_512_full64:
     vmovdqu64 zmm1, [rdi]
     vpxord zmm1, zmm1, zmm0
     vmovdqu64 [rdi], zmm1
     add rdi, 64
     sub rcx, 64
-
-    cmp rcx, 64
-    jbe .u_512_final
-    vmovdqu64 zmm1, [rdi]
-    vpxord zmm1, zmm1, zmm0
-    vmovdqu64 [rdi], zmm1
-    add rdi, 64
-    sub rcx, 64
-
-    cmp rcx, 64
-    jbe .u_512_final
-    vmovdqu64 zmm1, [rdi]
-    vpxord zmm1, zmm1, zmm0
-    vmovdqu64 [rdi], zmm1
-    add rdi, 64
-    sub rcx, 64
-
-    ; ---- OPMASK TAIL (in-place) ----
-.u_512_final:
-    cmp rcx, 64
-    je .u_512_final_full
-
-    mov rax, 1
-    shl rax, cl
     dec rax
+    jnz .u_512_full64
+
+    ; ---- OPMASK TAIL (in-place): rcx remaining bytes (0-63) ----
+    ; BZHI with rcx=0 → mask=0 → vmovdqu8{k1=0} is a safe no-op
+.u_512_final:
+    mov rax, -1
+    bzhi rax, rax, rcx
     kmovq k1, rax
+
     vmovdqu8 zmm1{k1}{z}, [rdi]
     vpxord zmm1, zmm1, zmm0
     vmovdqu8 [rdi]{k1}, zmm1
-    jmp .u_512_done
-
-.u_512_final_full:
-    vmovdqu64 zmm1, [rdi]
-    vpxord zmm1, zmm1, zmm0
-    vmovdqu64 [rdi], zmm1
 
 .u_512_done:
     vzeroupper
@@ -513,15 +470,18 @@ ws_unmask:
     align 32
 .u_nt512:
     mov rax, rdi
-    and rax, 63
+    neg rax
+    and rax, 63                 ; bytes to next 64-byte boundary: (-rdi) & 63
     jz  .u_nt512_aligned
 
 .u_nt512_prologue:
     xor byte [rdi], r8b
+    ror r8d, 8                  ; advance to next mask byte
     inc rdi
     sub rcx, 1
     sub rax, 1
     jnz .u_nt512_prologue
+    vpbroadcastd zmm0, r8d      ; re-sync vector mask to current phase
 
 .u_nt512_aligned:
     mov rax, rcx
@@ -619,15 +579,19 @@ ws_unmask:
 .u_nt_avx2:
     ; Align destination to 32-byte boundary
     mov rax, rdi
-    and rax, 31
+    neg rax
+    and rax, 31                 ; bytes to next 32-byte boundary: (-rdi) & 31
     jz  .u_nt_avx2_aligned
 
 .u_nt_avx2_prologue:
     xor byte [rdi], r8b
+    ror r8d, 8                  ; advance to next mask byte
     inc rdi
     sub rcx, 1
     sub rax, 1
     jnz .u_nt_avx2_prologue
+    vmovd xmm0, r8d
+    vpbroadcastd ymm0, xmm0     ; re-sync vector mask to current phase
 
 .u_nt_avx2_aligned:
     mov rax, rcx
@@ -764,72 +728,72 @@ ws_find_header:
 
     movdqu xmm0, [r14]         ; first 16 bytes of needle
 
-    xor rcx, rcx                ; current position
+    ; r11 = outer scan position (caller-saved — no push/pop needed)
+    xor r11, r11
 
     ; PCMPISTRI mode 0x0C = Equal Ordered (substring match)
-    ; Compares bytes in xmm0 against 16 bytes at [buf+pos]
-    ; Sets ECX to index of first match within the 16-byte window
+    ; Compares bytes in xmm0 against 16 bytes at [buf+r11]
+    ; CF=1 if match found; ECX = inner match index (0-15)
+    ; CF=0 if no match;    ECX = 16
+    ; r11 is kept in a separate register so pcmpistri cannot destroy it
     align 16
 .hdr_scan:
     lea rax, [r13]
-    sub rax, rcx
+    sub rax, r11
     cmp rax, 16
-    jl .hdr_scalar_tail         ; less than 16 bytes left
+    jl .hdr_scalar_tail         ; fewer than 16 bytes left
 
-    pcmpistri xmm0, [r12 + rcx], 0x0C
-    ; CF=1 if match found, ECX=index
-    jc .hdr_candidate
-    add rcx, 16                 ; advance by 16
+    pcmpistri xmm0, [r12 + r11], 0x0C
+    jnc .hdr_no_match
+    ; CF=1: candidate at absolute position r11 + rcx
+    lea rax, [r11 + rcx]        ; rax = absolute candidate position
+
+.hdr_verify:
+    push rax
+    lea rdi, [r12 + rax]
+    mov rsi, r14
+    mov rcx, rbx
+    repe cmpsb
+    pop rax
+    je .hdr_found               ; full match — rax = needle start
+
+    lea r11, [rax + 1]          ; resume scan past this candidate
     jmp .hdr_scan
 
-.hdr_candidate:
-    ; ECX has match offset within the 16-byte window
-    add rcx, rcx                ; ... wait, PCMPISTRI output is in ECX
-    ; Actually: after PCMPISTRI, IntRes2 index is in ECX
-    ; But this is the position of the first matching BYTE within the window
-    ; We need to verify the full needle starting at buf + (outer_pos + ecx)
-
-    ; Save scan position
-    push rcx
-    mov rdi, r12
-    add rdi, rcx                ; rdi = buf + match position
-    mov rsi, r14                ; needle
-    mov rdx, rbx                ; needle_len
-
-    ; Verify full match with REP CMPSB
-    mov rcx, rdx
-    repe cmpsb
-    pop rcx
-
-    je .hdr_found               ; full match!
-
-    inc rcx                     ; advance past failed match
+.hdr_no_match:
+    add r11, 16                 ; advance outer position by full window
     jmp .hdr_scan
 
 .hdr_scalar_tail:
-    ; Less than 16 bytes remaining — do byte-by-byte
+    ; Fewer than 16 bytes remaining — do byte-by-byte
     lea rax, [r13]
-    sub rax, rbx                ; max valid start position
+    sub rax, rbx                ; rax = max valid start = len - needle_len
 .hdr_scalar:
-    cmp rcx, rax
+    cmp r11, rax
     jg .hdr_not_found
 
-    ; Compare needle at current position
-    push rcx
-    lea rdi, [r12 + rcx]
+    push r11
+    lea rdi, [r12 + r11]
     mov rsi, r14
-    mov rdx, rbx
-    mov rcx, rdx
+    mov rcx, rbx
     repe cmpsb
-    pop rcx
-    je .hdr_found
+    pop r11
+    je .hdr_found_scalar
 
-    inc rcx
+    inc r11
     jmp .hdr_scalar
 
+.hdr_found_scalar:
+    lea rax, [r11 + rbx]        ; value start = match_pos + needle_len
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
 .hdr_found:
-    ; Return offset of value (position + needle_len)
-    lea rax, [rcx + rbx]
+    ; rax = needle start, rbx = needle_len
+    add rax, rbx                ; value start = needle_start + needle_len
     pop r14
     pop r13
     pop r12

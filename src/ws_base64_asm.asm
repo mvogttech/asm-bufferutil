@@ -12,9 +12,10 @@
 ;   rax = number of output bytes written (always ceil(len/3)*4)
 ;
 ; Dispatch order (fastest-available first):
-;   1. cpu_tier >= 2 (AVX2)          -> .avx2_path   (24 input bytes -> 32 output chars / iter)
-;   2. cpu_tier >= 1 (SSE2 baseline) -> .sse2_path   (12 input bytes -> 16 output chars / iter)
-;   3. fallback                      -> .scalar_path  ( 3 input bytes ->  4 output chars / iter)
+;   1. cpu_tier >= 3 + VBMI (bit 4) -> .avx512vbmi_path (24 in -> 32 out / iter, VPERMB)
+;   2. cpu_tier >= 2 (AVX2)         -> .avx2_path        (24 in -> 32 out / iter)
+;   3. cpu_tier >= 1 (SSE2)         -> .sse2_path         (12 in -> 16 out / iter)
+;   4. fallback                     -> .scalar_path        ( 3 in ->  4 out / iter)
 ;
 ; Algorithm: Klomp/Muła VPSHUFB method (vectorised base64 encoding)
 ;
@@ -103,6 +104,7 @@ BITS 64
 DEFAULT REL
 
 extern cpu_tier
+extern cpu_features
 
 ; ============================================================================
 ; .data — lookup tables and broadcast constant vectors
@@ -222,12 +224,67 @@ ws_base64_encode:
     ; and is declared extern above.  We use RIP-relative addressing
     ; (DEFAULT REL ensures this).
     ; ------------------------------------------------------------------
+    cmp  dword [cpu_tier], 3
+    jl   .b64_check_avx2
+    test dword [cpu_features], (1 << 4)   ; VBMI bit
+    jnz  .avx512vbmi_path
+
+.b64_check_avx2:
     cmp  dword [cpu_tier], 2
     jge  .avx2_path
 
     cmp  dword [cpu_tier], 1
     jge  .sse2_path
 
+    jmp  .scalar_path
+
+
+; ============================================================================
+; AVX-512VBMI PATH — 24 input bytes -> 32 output characters per iteration
+;
+; Extraction pipeline is identical to the AVX2 path (VPSHUFB + VPMADDUBSW +
+; VPACKUSWB + VPSHUFB).  The 13-instruction classify/map chain is replaced by
+; a single VPERMB that indexes directly into the 64-byte b64_table.
+;
+; After VEX-encoded YMM writes, zmm[511:256] = 0 (Intel manual §2.3.5).
+; VPERMB ZMM uses index & 63, so zero upper bytes map to b64_table[0]='A'.
+; Only the lower ymm3 (32 bytes) is stored — upper bytes are discarded.
+; ============================================================================
+    align 32
+.avx512vbmi_path:
+    vmovdqa64  zmm9, [b64_table]          ; preload 64-byte LUT once (align 64 in .data)
+
+    align 32
+.avx512vbmi_loop:
+    ; Guard: need 32 bytes for a safe 32-byte vmovdqu load.
+    mov  rax, r13
+    sub  rax, r15
+    cmp  rax, 32
+    jl   .avx512vbmi_tail
+
+    ; ---- Steps 1-4: identical to AVX2 path ----
+    vmovdqu    ymm0, [r12 + r15]
+    vpshufb    ymm0, ymm0, [b64_shuf]
+    vpmaddubsw ymm1, ymm0, [b64_mul_lo]
+    vpsrlw     ymm1, ymm1, 10
+    vpmaddubsw ymm2, ymm0, [b64_mul_hi]
+    vpand      ymm2, ymm2, [b64_mask3f]
+    vpackuswb  ymm3, ymm1, ymm2
+    vpshufb    ymm3, ymm3, [b64_pack_shuf]   ; ymm3 = 32 six-bit indices (0-63)
+
+    ; ---- Steps 5+6: map 6-bit index -> ASCII in one instruction ----
+    ; vpermb dst, idx, src — for each byte i: dst[i] = src[idx[i] & 63]
+    vpermb     zmm3, zmm3, zmm9
+
+    ; ---- Step 7: store 32 output bytes (lower ymm3 half of zmm3) ----
+    vmovdqu    [r14 + rbx], ymm3
+
+    add  r15, 24
+    add  rbx, 32
+    jmp  .avx512vbmi_loop
+
+.avx512vbmi_tail:
+    vzeroupper
     jmp  .scalar_path
 
 

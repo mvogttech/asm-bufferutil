@@ -259,6 +259,54 @@ console.log('\nmask() NT-store path tests (>= 256KB):');
   assert(buffersEqual(masked, original), '512 KB roundtrip (NT path): mask → unmask recovers original');
 }
 
+// NT prologue mask-cycling tests — non-zero offset forces dest into a
+// misaligned position, exercising the byte-by-byte alignment prologue.
+// A bug here produces silent data corruption (wrong mask bytes in the
+// first 1-63 bytes of output), caught by comparison with JS reference.
+{
+  const source = crypto.randomBytes(512 * 1024);
+  const mask = Buffer.from([0x11, 0x22, 0x33, 0x44]);
+  const output1 = Buffer.alloc(source.length + 1);
+  const output2 = Buffer.alloc(source.length + 1);
+
+  asmUtil.mask(source, mask, output1, 1, source.length);
+  jsUtil.mask(source, mask, output2, 1, source.length);
+
+  assert(buffersEqual(output1, output2), '512 KB mask, offset=1 — NT prologue mask cycling');
+}
+
+{
+  const source = crypto.randomBytes(512 * 1024);
+  const mask = Buffer.from([0xAA, 0xBB, 0xCC, 0xDD]);
+  const output1 = Buffer.alloc(source.length + 3);
+  const output2 = Buffer.alloc(source.length + 3);
+
+  asmUtil.mask(source, mask, output1, 3, source.length);
+  jsUtil.mask(source, mask, output2, 3, source.length);
+
+  assert(buffersEqual(output1, output2), '512 KB mask, offset=3 — NT prologue mask cycling (3-byte rotation)');
+}
+
+{
+  // Unmask: slice the buffer by 1 to force misaligned rdi in ws_unmask NT path
+  const original = crypto.randomBytes(512 * 1024);
+  const mask = Buffer.from([0x12, 0x34, 0x56, 0x78]);
+  const padded = Buffer.alloc(original.length + 1);
+  original.copy(padded, 1);                  // data starts at byte 1
+
+  const masked1 = Buffer.from(padded);       // copy for asm path
+  const masked2 = Buffer.from(padded);       // copy for JS  reference
+
+  // mask only the payload region (offset 1..length)
+  const maskSlice1 = masked1.subarray(1);
+  const maskSlice2 = masked2.subarray(1);
+
+  asmUtil.unmask(maskSlice1, mask);
+  jsUtil.unmask(maskSlice2, mask);
+
+  assert(buffersEqual(maskSlice1, maskSlice2), '512 KB unmask, misaligned buffer — NT prologue mask cycling');
+}
+
 // --- Test: cpuFeatures bitmask (if available) ---
 if (typeof asmUtil.cpuFeatures === 'number') {
   console.log('\ncpuFeatures bitmask:');
@@ -270,7 +318,8 @@ if (typeof asmUtil.cpuFeatures === 'number') {
     if (asmUtil.cpuFeatures & 1) bits.push('GFNI');
     if (asmUtil.cpuFeatures & 2) bits.push('PCLMULQDQ');
     if (asmUtil.cpuFeatures & 4) bits.push('BMI2');
-    if (asmUtil.cpuFeatures & 8) bits.push('LZCNT');
+    if (asmUtil.cpuFeatures & 8)  bits.push('LZCNT');
+    if (asmUtil.cpuFeatures & 16) bits.push('VBMI');
     console.log(`  (detected: 0x${asmUtil.cpuFeatures.toString(16).padStart(2,'0')} = [${bits.join(', ') || 'none'}])`);
   }
 }

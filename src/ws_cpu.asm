@@ -5,13 +5,14 @@
 ;   0 = scalar only
 ;   1 = SSE2 baseline
 ;   2 = AVX2
-;   3 = AVX-512F+BW (disabled on production Alder Lake)
+;   3 = AVX-512F+BW
 ;
 ; cpu_features bitmask:
 ;   bit 0 = GFNI      (CPUID.7.0:ECX[8])
 ;   bit 1 = PCLMULQDQ (CPUID.1:ECX[1])
 ;   bit 2 = BMI2      (CPUID.7.0:EBX[8])
 ;   bit 3 = LZCNT     (CPUID.0x80000001:ECX[5])
+;   bit 4 = VBMI      (CPUID.7.0:ECX[1], only set when cpu_tier == 3)
 
 BITS 64
 DEFAULT REL
@@ -27,79 +28,103 @@ global cpu_tier
 global cpu_features
 global _init_cpu_features
 
+; Register allocation across the function:
+;   r8d  = XCR0 (from xgetbv)
+;   r9d  = max basic leaf (from CPUID leaf 0)
+;   r10d = leaf 1 ECX  (OSXSAVE, PCLMULQDQ)
+;   r11d = leaf 7 EBX  (AVX2, AVX-512F/BW, BMI2)
+;   r12d = leaf 7 ECX  (GFNI, VBMI)   [callee-saved — must push/pop]
+;
+; Each CPUID leaf is executed exactly once.  The caller-saved scratch
+; registers r8-r11 need no push/pop; only r12 (callee-saved) does.
+
 _init_cpu_features:
     push rbx
+    push r12
 
-    ; --- Tier detection ---
-    mov dword [cpu_tier], 1         ; SSE2 baseline
+    ; Default = SSE2 baseline
+    mov dword [cpu_tier], 1
 
+    ; === Leaf 0: max basic leaf ===
     xor eax, eax
     cpuid
-    cmp eax, 7
-    jl .feat_detect
+    mov r9d, eax                    ; r9d = max basic leaf
 
+    ; === Leaf 1: OSXSAVE + PCLMULQDQ ===
     mov eax, 1
     cpuid
-    test ecx, (1 << 27)             ; OSXSAVE
+    mov r10d, ecx                   ; r10d = leaf 1 ECX
+
+    ; === Leaf 7 (if available) — AVX2, AVX-512F/BW, BMI2, GFNI, VBMI ===
+    cmp r9d, 7
+    jb .no_leaf7
+    mov eax, 7
+    xor ecx, ecx
+    cpuid
+    mov r11d, ebx                   ; r11d = leaf 7 EBX
+    mov r12d, ecx                   ; r12d = leaf 7 ECX
+.no_leaf7:
+
+    ; === Tier detection (AVX2 / AVX-512) ===
+    test r10d, (1 << 27)            ; OSXSAVE?
     jz .feat_detect
 
     xor ecx, ecx
     xgetbv
-    mov r8d, eax
+    mov r8d, eax                    ; r8d = XCR0
+
     and eax, 0x06
-    cmp eax, 0x06                   ; YMM state saved by OS
+    cmp eax, 0x06                   ; YMM state saved by OS?
     jne .feat_detect
 
-    mov eax, 7
-    xor ecx, ecx
-    cpuid
-    test ebx, (1 << 5)              ; AVX2
+    cmp r9d, 7
+    jb .feat_detect
+    test r11d, (1 << 5)             ; AVX2?
     jz .feat_detect
     mov dword [cpu_tier], 2
 
     mov eax, r8d
     and eax, 0xE0
-    cmp eax, 0xE0                   ; ZMM/opmask state saved by OS
+    cmp eax, 0xE0                   ; ZMM/opmask state saved by OS?
     jne .feat_detect
-    test ebx, (1 << 16)             ; AVX-512F
+    test r11d, (1 << 16)            ; AVX-512F?
     jz .feat_detect
-    test ebx, (1 << 30)             ; AVX-512BW
+    test r11d, (1 << 30)            ; AVX-512BW?
     jz .feat_detect
     mov dword [cpu_tier], 3
 
-    ; --- Feature bitmask detection ---
-    ; (runs regardless of tier — these features are orthogonal)
 .feat_detect:
-    xor eax, eax
-    cpuid
-    cmp eax, 7
-    jl .check_pclmul
+    ; === Feature bitmask (all use cached leaf results — no further CPUID) ===
+    cmp r9d, 7
+    jb .check_pclmul
 
-    mov eax, 7
-    xor ecx, ecx
-    cpuid
-
-    ; GFNI: leaf 7 ECX bit 8
-    test ecx, (1 << 8)
-    jz .check_bmi2
+    ; GFNI (bit 0): leaf 7 ECX bit 8
+    test r12d, (1 << 8)
+    jz .check_vbmi
     or dword [cpu_features], 1
 
+.check_vbmi:
+    ; VBMI (bit 4): leaf 7 ECX bit 1 — only useful when cpu_tier == 3
+    cmp dword [cpu_tier], 3
+    jl .check_bmi2
+    test r12d, (1 << 1)
+    jz .check_bmi2
+    or dword [cpu_features], (1 << 4)
+
 .check_bmi2:
-    ; BMI2: leaf 7 EBX bit 8
-    test ebx, (1 << 8)
+    ; BMI2 (bit 2): leaf 7 EBX bit 8
+    test r11d, (1 << 8)
     jz .check_pclmul
     or dword [cpu_features], 4
 
 .check_pclmul:
-    ; PCLMULQDQ: leaf 1 ECX bit 1
-    mov eax, 1
-    cpuid
-    test ecx, (1 << 1)
+    ; PCLMULQDQ (bit 1): leaf 1 ECX bit 1 (cached — no re-execution)
+    test r10d, (1 << 1)
     jz .check_lzcnt
     or dword [cpu_features], 2
 
 .check_lzcnt:
-    ; LZCNT: extended leaf 0x80000001 ECX bit 5
+    ; LZCNT (bit 3): extended leaf 0x80000001 ECX bit 5
     mov eax, 0x80000000
     cpuid
     cmp eax, 0x80000001
@@ -111,6 +136,7 @@ _init_cpu_features:
     or dword [cpu_features], 8
 
 .all_done:
+    pop r12
     pop rbx
     ret
 
