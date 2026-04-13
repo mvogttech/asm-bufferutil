@@ -14,7 +14,8 @@
 ;                          naturally handles rcx=64 (all-ones) with no branch
 ;   KMOVQ k1, rax        — load opmask from GPR (AVX-512BW)
 ;   PCMPISTRI xmm, m, im — string comparison (SSE4.2)
-;   PREFETCHNTA          — non-temporal prefetch
+;   PREFETCHT0           — temporal prefetch into all cache levels (cached path)
+;   PREFETCHNTA          — non-temporal prefetch (NT-store path only)
 ;   VMOVNTDQ             — non-temporal store (cache-bypass)
 ;   REP MOVSB            — fast memcpy (ERMS/FSRM)
 ;
@@ -58,7 +59,7 @@ ws_mask:
 .m_avx512:
     vpbroadcastd zmm0, r8d
 
-    cmp rcx, (1 << 18)          ; >= 256KB → NT path
+    cmp rcx, (1 << 23)          ; >= 8MB → NT path
     jae .m_nt512
 
     ; 4x unrolled: 256 bytes/iter
@@ -69,7 +70,7 @@ ws_mask:
 
     align 32
 .m_512_256:
-    prefetchnta [rdi + 1024]
+    prefetcht0 [rdi + 1024]
     vmovdqu64 zmm1, [rdi]
     vmovdqu64 zmm2, [rdi + 64]
     vmovdqu64 zmm3, [rdi + 128]
@@ -184,7 +185,7 @@ ws_mask:
     vmovd xmm0, r8d
     vpbroadcastd ymm0, xmm0
 
-    cmp rcx, (1 << 18)
+    cmp rcx, (1 << 23)          ; >= 8MB → NT path
     jae .m_nt_avx2
 
     mov rax, rcx
@@ -194,7 +195,7 @@ ws_mask:
 
     align 32
 .m_avx2_128:
-    prefetchnta [rdi + 512]
+    prefetcht0 [rdi + 512]
     vmovdqu ymm1, [rdi]
     vmovdqu ymm2, [rdi + 32]
     vmovdqu ymm3, [rdi + 64]
@@ -310,7 +311,7 @@ ws_mask:
 
     align 16
 .m_sse2_64:
-    prefetchnta [rdi + 256]
+    prefetcht0 [rdi + 256]
     movdqu xmm1, [rdi]
     movdqu xmm2, [rdi + 16]
     movdqu xmm3, [rdi + 32]
@@ -404,7 +405,7 @@ ws_unmask:
 .u_avx512:
     vpbroadcastd zmm0, r8d
 
-    cmp rcx, (1 << 18)
+    cmp rcx, (1 << 23)          ; >= 8MB → NT path
     jae .u_nt512
 
     mov rax, rcx
@@ -414,7 +415,7 @@ ws_unmask:
 
     align 32
 .u_512_256:
-    prefetchnta [rdi + 1024]
+    prefetcht0 [rdi + 1024]
     vmovdqu64 zmm1, [rdi]
     vmovdqu64 zmm2, [rdi + 64]
     vmovdqu64 zmm3, [rdi + 128]
@@ -521,7 +522,7 @@ ws_unmask:
     vmovd xmm0, r8d
     vpbroadcastd ymm0, xmm0
 
-    cmp rcx, (1 << 18)
+    cmp rcx, (1 << 23)          ; >= 8MB → NT path
     jae .u_nt_avx2
 
     mov rax, rcx
@@ -531,7 +532,7 @@ ws_unmask:
 
     align 32
 .u_avx2_128:
-    prefetchnta [rdi + 512]
+    prefetcht0 [rdi + 512]
     vmovdqu ymm1, [rdi]
     vmovdqu ymm2, [rdi + 32]
     vmovdqu ymm3, [rdi + 64]
@@ -638,7 +639,7 @@ ws_unmask:
     jz .u_sse2_t16
     align 16
 .u_sse2_64:
-    prefetchnta [rdi + 256]
+    prefetcht0 [rdi + 256]
     movdqu xmm1, [rdi]
     movdqu xmm2, [rdi + 16]
     movdqu xmm3, [rdi + 32]

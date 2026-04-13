@@ -107,11 +107,12 @@ console.log('──────────────┼───────�
 
 for (const { name, size } of sizes) {
   const mask  = crypto.randomBytes(4);
+  const buf   = crypto.randomBytes(size);
   const iters = Math.max(100, Math.floor(5_000_000 / size));
 
-  const jsOps  = bench(() => { const buf = crypto.randomBytes(size); jsUtil.unmask(buf, mask); }, iters);
-  const buOps  = buUtil  ? bench(() => { const buf = crypto.randomBytes(size); buUtil.unmask(buf, mask); }, iters) : null;
-  const asmOps = asmUtil ? bench(() => { const buf = crypto.randomBytes(size); asmUtil.unmask(buf, mask); }, iters) : null;
+  const jsOps  = bench(() => jsUtil.unmask(buf, mask), iters);
+  const buOps  = buUtil  ? bench(() => buUtil.unmask(buf, mask), iters) : null;
+  const asmOps = asmUtil ? bench(() => asmUtil.unmask(buf, mask), iters) : null;
 
   const vsRef = fmtSpeedup(asmOps, buOps ?? jsOps);
 
