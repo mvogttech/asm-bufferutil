@@ -85,11 +85,12 @@ npm run bench
 ## Usage
 
 ### Standalone
-```javascript
-const bufferUtil = require('asm-bufferutil');
-const crypto = require('crypto');
 
-const payload = Buffer.from('Hello WebSocket!');
+```javascript
+const bufferUtil = require("asm-bufferutil");
+const crypto = require("crypto");
+
+const payload = Buffer.from("Hello WebSocket!");
 const mask = crypto.randomBytes(4);
 const output = Buffer.alloc(payload.length);
 
@@ -130,25 +131,25 @@ const WebSocket = require('ws');
 
 ## How this compares to bufferutil
 
-| Aspect | bufferutil | asm-bufferutil |
-|--------|-----------|----------------|
-| Language | C | x86-64 Assembly |
-| SIMD | Compiler decides (often uses it) | Explicit SSE2, guaranteed |
-| Masking strategy | 32-bit XOR in C loop | 128-bit PXOR (4× wider) |
-| N-API version | Same | Same |
-| API | `mask()`, `unmask()` | `mask()`, `unmask()` |
-| Portability | Any platform with C compiler | Linux x86-64 only |
+| Aspect           | bufferutil                       | asm-bufferutil            |
+| ---------------- | -------------------------------- | ------------------------- |
+| Language         | C                                | x86-64 Assembly           |
+| SIMD             | Compiler decides (often uses it) | Explicit SSE2, guaranteed |
+| Masking strategy | 32-bit XOR in C loop             | 128-bit PXOR (4× wider)   |
+| N-API version    | Same                             | Same                      |
+| API              | `mask()`, `unmask()`             | `mask()`, `unmask()`      |
+| Portability      | Any platform with C compiler     | Linux x86-64 only         |
 
 ## Relevant to Meteor/DDP
 
-If you're running Meteor.js, every DDP message (method calls, subscriptions, collection updates) goes through WebSocket framing. On a busy VisViva-style multi-tenant system with hundreds of concurrent connections, the masking loop runs thousands of times per second. Shaving microseconds here compounds into meaningful CPU savings.
+If you're running Meteor.js, every DDP message (method calls, subscriptions, collection updates) goes through WebSocket framing. On a busy system with hundreds of concurrent connections, the masking loop runs thousands of times per second. Shaving microseconds here compounds into meaningful CPU savings.
 
 To integrate with Meteor's internal WebSocket handling:
 
 ```javascript
 // server/startup.js
 // Meteor uses sockjs by default, but if using raw ws:
-import { WebApp } from 'meteor/webapp';
+import { WebApp } from "meteor/webapp";
 
 // The ws package inside Meteor will pick up bufferutil
 // if it's in node_modules. Use the package aliasing approach.
