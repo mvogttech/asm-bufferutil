@@ -500,13 +500,15 @@ ws_mask:
     mov [rdx], al
     dec rcx
     jz .m_ret
+    ror r8d, 8
     mov al, [rdi + 1]
-    xor al, byte [rsi + 1]
+    xor al, r8b
     mov [rdx + 1], al
     dec rcx
     jz .m_ret
+    ror r8d, 8
     mov al, [rdi + 2]
-    xor al, byte [rsi + 2]
+    xor al, r8b
     mov [rdx + 2], al
 .m_ret:
     ret
@@ -928,12 +930,12 @@ ws_unmask:
     xor byte [rdi], r8b
     dec rcx
     jz .u_ret
-    mov al, byte [rsi + 1]
-    xor byte [rdi + 1], al
+    ror r8d, 8
+    xor byte [rdi + 1], r8b
     dec rcx
     jz .u_ret
-    mov al, byte [rsi + 2]
-    xor byte [rdi + 2], al
+    ror r8d, 8
+    xor byte [rdi + 2], r8b
 .u_ret:
     ret
 
@@ -2098,13 +2100,15 @@ ws_mask_gfni:
     mov [rdx], al
     dec rcx
     jz .gf_ret
+    ror r8d, 8
     mov al, [rdi + 1]
-    xor al, byte [rsi + 1]
+    xor al, r8b
     mov [rdx + 1], al
     dec rcx
     jz .gf_ret
+    ror r8d, 8
     mov al, [rdi + 2]
-    xor al, byte [rsi + 2]
+    xor al, r8b
     mov [rdx + 2], al
 .gf_ret:
     ret
