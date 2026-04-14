@@ -129,7 +129,39 @@ ws_mask:
     cmp rcx, [nt_threshold]     ; >= NT threshold → NT path
     jae .m_nt512
 
-    ; 8x unrolled: 512 bytes/iter
+    ; Align destination (rdx) to 64-byte boundary using opmask partial store
+    mov rax, rdx
+    neg rax
+    and rax, 63                 ; bytes to next 64-byte boundary
+    jz .m_512_aligned
+    cmp rax, rcx                ; preamble larger than total payload?
+    jae .m_512_tail             ; → skip alignment, do unaligned tail
+
+    mov r9, -1
+    bzhi r9, r9, rax
+    kmovq k1, r9
+
+    vmovdqu8 zmm1{k1}{z}, [rdi]
+    vpxord zmm1, zmm1, zmm0
+    vmovdqu8 [rdx]{k1}, zmm1
+
+    add rdi, rax
+    add rdx, rax
+    sub rcx, rax
+
+    ; Re-sync mask vector if advance was not a multiple of 4
+    test al, 3
+    jz .m_512_aligned
+    mov r9, rcx                 ; save length (need cl for ror)
+    mov ecx, eax
+    and ecx, 3
+    shl ecx, 3                  ; rotation amount in bits
+    ror r8d, cl
+    mov rcx, r9
+    vpbroadcastd zmm0, r8d
+
+.m_512_aligned:
+    ; 8x unrolled: 512 bytes/iter (rdx now 64-byte aligned)
     mov rax, rcx
     shr rax, 9
     test rax, rax
@@ -258,7 +290,7 @@ ws_mask:
     jmp .m_512_tail             ; handle remainder with existing opmask path
 
 
-    ; ==================== AVX2 (unchanged from v3) ====================
+    ; ==================== AVX2 ====================
     align 32
 .m_avx2:
     vmovd xmm0, r8d
@@ -267,6 +299,42 @@ ws_mask:
     cmp rcx, [nt_threshold]     ; >= NT threshold → NT path
     jae .m_nt_avx2
 
+    ; Align destination (rdx) to 32-byte boundary
+    mov rax, rdx
+    neg rax
+    and rax, 31                 ; bytes to next 32-byte boundary
+    jz .m_avx2_aligned
+    cmp rax, rcx
+    jae .m_avx2_aligned         ; tiny payload — not worth aligning
+    sub rcx, rax
+
+.m_avx2_pre_dw:
+    cmp rax, 4
+    jb .m_avx2_pre_bytes
+    mov r9d, [rdi]
+    xor r9d, r8d
+    mov [rdx], r9d
+    add rdi, 4
+    add rdx, 4
+    sub rax, 4
+    jmp .m_avx2_pre_dw
+
+.m_avx2_pre_bytes:
+    test rax, rax
+    jz .m_avx2_aligned
+.m_avx2_pre_byte:
+    mov r9b, [rdi]
+    xor r9b, r8b
+    mov [rdx], r9b
+    ror r8d, 8
+    inc rdi
+    inc rdx
+    dec rax
+    jnz .m_avx2_pre_byte
+    vmovd xmm0, r8d
+    vpbroadcastd ymm0, xmm0    ; re-sync after mask rotation
+
+.m_avx2_aligned:
     mov rax, rcx
     shr rax, 7
     test rax, rax
@@ -542,6 +610,37 @@ ws_unmask:
     cmp rcx, [nt_threshold]     ; >= NT threshold → NT path
     jae .u_nt512
 
+    ; Align buffer (rdi) to 64-byte boundary using opmask partial store
+    mov rax, rdi
+    neg rax
+    and rax, 63                 ; bytes to next 64-byte boundary
+    jz .u_512_aligned
+    cmp rax, rcx
+    jae .u_512_tail             ; preamble >= total → do unaligned tail
+
+    mov r9, -1
+    bzhi r9, r9, rax
+    kmovq k1, r9
+
+    vmovdqu8 zmm1{k1}{z}, [rdi]
+    vpxord zmm1, zmm1, zmm0
+    vmovdqu8 [rdi]{k1}, zmm1
+
+    add rdi, rax
+    sub rcx, rax
+
+    ; Re-sync mask vector if advance was not a multiple of 4
+    test al, 3
+    jz .u_512_aligned
+    mov r9, rcx
+    mov ecx, eax
+    and ecx, 3
+    shl ecx, 3
+    ror r8d, cl
+    mov rcx, r9
+    vpbroadcastd zmm0, r8d
+
+.u_512_aligned:
     ; Dual-stream: process 256 bytes from front + 256 from back per iteration.
     ; Two independent memory streams increase page-level parallelism and
     ; TLB coverage for large in-place buffers.
@@ -683,6 +782,36 @@ ws_unmask:
     cmp rcx, [nt_threshold]     ; >= NT threshold → NT path
     jae .u_nt_avx2
 
+    ; Align buffer (rdi) to 32-byte boundary
+    mov rax, rdi
+    neg rax
+    and rax, 31
+    jz .u_avx2_aligned
+    cmp rax, rcx
+    jae .u_avx2_aligned         ; tiny payload — not worth aligning
+    sub rcx, rax
+
+.u_avx2_pre_dw:
+    cmp rax, 4
+    jb .u_avx2_pre_bytes
+    xor dword [rdi], r8d
+    add rdi, 4
+    sub rax, 4
+    jmp .u_avx2_pre_dw
+
+.u_avx2_pre_bytes:
+    test rax, rax
+    jz .u_avx2_aligned
+.u_avx2_pre_byte:
+    xor byte [rdi], r8b
+    ror r8d, 8
+    inc rdi
+    dec rax
+    jnz .u_avx2_pre_byte
+    vmovd xmm0, r8d
+    vpbroadcastd ymm0, xmm0    ; re-sync after mask rotation
+
+.u_avx2_aligned:
     mov rax, rcx
     shr rax, 7
     test rax, rax
