@@ -14,11 +14,21 @@ extern "C" {
     void _init_cpu_features(void);
     void ws_mask(const uint8_t *src, const uint8_t *mask,
                  uint8_t *out, size_t offset, size_t length);
+    void ws_mask_gfni(const uint8_t *src, const uint8_t *mask,
+                      uint8_t *out, size_t offset, size_t length);
     void ws_unmask(uint8_t *buf, const uint8_t *mask, size_t length);
+    void ws_unmask4(uint8_t *data, const uint32_t *offsets,
+                    const uint32_t *lengths, const uint8_t *masks,
+                    uint32_t count);
+    void ws_mask4(const uint8_t *src, uint8_t *dst,
+                  const uint32_t *offsets, const uint32_t *lengths,
+                  const uint8_t *masks, uint32_t count);
     int64_t ws_find_header(const uint8_t *buf, size_t len,
                             const uint8_t *needle, size_t needle_len);
     size_t ws_base64_encode(const uint8_t *in, size_t len, uint8_t *out);
+    int ws_utf8_validate(const uint8_t *buf, size_t len);
     extern uint32_t cpu_features;
+    extern uint32_t cpu_tier;
     int  ws_has_sha_ni(void);
     void ws_sha1_ni(const uint8_t *msg, size_t len, uint8_t out[20]);
 }
@@ -35,6 +45,16 @@ static void Mask(const v8::FunctionCallbackInfo<v8::Value>& args) {
     uint32_t offset = args[3]->Uint32Value(ctx).FromJust();
     uint32_t length = args[4]->Uint32Value(ctx).FromJust();
     ws_mask(src, mask, out, offset, length);
+}
+
+static void MaskGfni(const v8::FunctionCallbackInfo<v8::Value>& args) {
+    auto ctx = args.GetIsolate()->GetCurrentContext();
+    auto *src  = reinterpret_cast<uint8_t*>(node::Buffer::Data(args[0]));
+    auto *mask = reinterpret_cast<uint8_t*>(node::Buffer::Data(args[1]));
+    auto *out  = reinterpret_cast<uint8_t*>(node::Buffer::Data(args[2]));
+    uint32_t offset = args[3]->Uint32Value(ctx).FromJust();
+    uint32_t length = args[4]->Uint32Value(ctx).FromJust();
+    ws_mask_gfni(src, mask, out, offset, length);
 }
 
 static void Unmask(const v8::FunctionCallbackInfo<v8::Value>& args) {
@@ -76,6 +96,14 @@ static void Base64Encode(const v8::FunctionCallbackInfo<v8::Value>& args) {
     args.GetReturnValue().Set(result);
 }
 
+static void Utf8Validate(const v8::FunctionCallbackInfo<v8::Value>& args) {
+    auto *isolate = args.GetIsolate();
+    auto *data = reinterpret_cast<uint8_t*>(node::Buffer::Data(args[0]));
+    auto  len  = node::Buffer::Length(args[0]);
+    int valid = ws_utf8_validate(data, len);
+    args.GetReturnValue().Set(v8::Boolean::New(isolate, valid != 0));
+}
+
 /* ====================================================================
  * Batch operations — amortize V8 call overhead across many frames
  *
@@ -98,8 +126,19 @@ static void BatchUnmask(const v8::FunctionCallbackInfo<v8::Value>& args) {
     auto *masks   = reinterpret_cast<uint8_t*>(node::Buffer::Data(args[3]));
     uint32_t count = args[4]->Uint32Value(ctx).FromJust();
 
-    for (uint32_t i = 0; i < count; i++) {
-        ws_unmask(data + offsets[i], masks + i * 4, lengths[i]);
+    uint32_t i = 0;
+    if (cpu_tier >= 3) {
+        for (; i + 4 <= count; i += 4) {
+            ws_unmask4(data, offsets + i, lengths + i, masks + i * 4, 4);
+        }
+        if (i < count) {
+            ws_unmask4(data, offsets + i, lengths + i, masks + i * 4, count - i);
+            return;
+        }
+    } else {
+        for (; i < count; i++) {
+            ws_unmask(data + offsets[i], masks + i * 4, lengths[i]);
+        }
     }
 }
 
@@ -120,9 +159,20 @@ static void BatchMask(const v8::FunctionCallbackInfo<v8::Value>& args) {
     auto *masks   = reinterpret_cast<uint8_t*>(node::Buffer::Data(args[4]));
     uint32_t count = args[5]->Uint32Value(ctx).FromJust();
 
-    for (uint32_t i = 0; i < count; i++) {
-        ws_mask(src + offsets[i], masks + i * 4,
-                dst + offsets[i], 0, lengths[i]);
+    uint32_t i = 0;
+    if (cpu_tier >= 3) {
+        for (; i + 4 <= count; i += 4) {
+            ws_mask4(src, dst, offsets + i, lengths + i, masks + i * 4, 4);
+        }
+        if (i < count) {
+            ws_mask4(src, dst, offsets + i, lengths + i, masks + i * 4, count - i);
+            return;
+        }
+    } else {
+        for (; i < count; i++) {
+            ws_mask(src + offsets[i], masks + i * 4,
+                    dst + offsets[i], 0, lengths[i]);
+        }
     }
 }
 
@@ -137,12 +187,14 @@ NODE_MODULE_INIT(/* exports, module, context */) {
 
     struct { const char *name; v8::FunctionCallback cb; } fns[] = {
         {"mask",         Mask},
+        {"maskGfni",     MaskGfni},
         {"unmask",       Unmask},
         {"sha1",         Sha1},
         {"findHeader",   FindHeader},
         {"base64Encode", Base64Encode},
         {"batchUnmask",  BatchUnmask},
         {"batchMask",    BatchMask},
+        {"utf8Validate", Utf8Validate},
     };
 
     for (auto& fn : fns) {

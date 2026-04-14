@@ -14,6 +14,7 @@
 ;   bit 3 = LZCNT     (CPUID.0x80000001:ECX[5])
 ;   bit 4 = VBMI      (CPUID.7.0:ECX[1], only set when cpu_tier == 3)
 ;   bit 5 = AMD vendor (skip vzeroupper — no SSE/AVX transition penalty)
+;   bit 6 = VBMI2     (CPUID.7.0:ECX[6], only set when cpu_tier == 3)
 
 BITS 64
 DEFAULT REL
@@ -37,7 +38,7 @@ global _init_cpu_features
 ;   r9d  = max basic leaf (from CPUID leaf 0)
 ;   r10d = leaf 1 ECX  (OSXSAVE, PCLMULQDQ)
 ;   r11d = leaf 7 EBX  (AVX2, AVX-512F/BW, BMI2)
-;   r12d = leaf 7 ECX  (GFNI, VBMI)   [callee-saved — must push/pop]
+;   r12d = leaf 7 ECX  (GFNI, VBMI, VBMI2)  [callee-saved — must push/pop]
 ;
 ; Each CPUID leaf is executed exactly once.  The caller-saved scratch
 ; registers r8-r11 need no push/pop; only r12 (callee-saved) does.
@@ -65,7 +66,7 @@ _init_cpu_features:
     cpuid
     mov r10d, ecx                   ; r10d = leaf 1 ECX
 
-    ; === Leaf 7 (if available) — AVX2, AVX-512F/BW, BMI2, GFNI, VBMI ===
+    ; === Leaf 7 (if available) — AVX2, AVX-512F/BW, BMI2, GFNI, VBMI, VBMI2 ===
     cmp r9d, 7
     jb .no_leaf7
     mov eax, 7
@@ -118,8 +119,16 @@ _init_cpu_features:
     cmp dword [cpu_tier], 3
     jl .check_bmi2
     test r12d, (1 << 1)
-    jz .check_bmi2
+    jz .check_vbmi2
     or dword [cpu_features], (1 << 4)
+
+.check_vbmi2:
+    ; VBMI2 (bit 6): leaf 7 ECX bit 6 — only useful when cpu_tier == 3
+    cmp dword [cpu_tier], 3
+    jl .check_bmi2
+    test r12d, (1 << 6)
+    jz .check_bmi2
+    or dword [cpu_features], (1 << 6)
 
 .check_bmi2:
     ; BMI2 (bit 2): leaf 7 EBX bit 8

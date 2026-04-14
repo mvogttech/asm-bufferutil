@@ -419,6 +419,189 @@ if (typeof asmUtil.batchMask === 'function') {
   }
 }
 
+// --- Test: maskGfni function (GFNI experiment baseline) ---
+if (typeof asmUtil.maskGfni === 'function') {
+  console.log('\nmaskGfni() tests (GFNI experiment):');
+
+  // maskGfni should produce identical output to mask for all sizes
+  {
+    const testSizes = [0, 1, 3, 13, 16, 33, 64, 127, 128, 255, 256, 1024, 65536];
+    for (const size of testSizes) {
+      const source = crypto.randomBytes(size);
+      const mask = crypto.randomBytes(4);
+      const out1 = Buffer.alloc(size);
+      const out2 = Buffer.alloc(size);
+
+      asmUtil.mask(source, mask, out1, 0, size);
+      asmUtil.maskGfni(source, mask, out2, 0, size);
+
+      assert(
+        buffersEqual(out1, out2),
+        `maskGfni matches mask for ${size} bytes`
+      );
+    }
+  }
+
+  // maskGfni with non-zero offset
+  {
+    const source = crypto.randomBytes(200);
+    const mask = crypto.randomBytes(4);
+    const out1 = Buffer.alloc(250);
+    const out2 = Buffer.alloc(250);
+
+    asmUtil.mask(source, mask, out1, 37, source.length);
+    asmUtil.maskGfni(source, mask, out2, 37, source.length);
+
+    assert(
+      buffersEqual(out1, out2),
+      'maskGfni matches mask with non-zero offset (37)'
+    );
+  }
+}
+
+// --- Test: utf8Validate function ---
+if (typeof asmUtil.utf8Validate === 'function') {
+  console.log('\nutf8Validate() tests:');
+
+  // Valid UTF-8: ASCII
+  assert(asmUtil.utf8Validate(Buffer.from('Hello, World!')), 'ASCII is valid UTF-8');
+
+  // Valid UTF-8: empty buffer
+  assert(asmUtil.utf8Validate(Buffer.from('')), 'Empty buffer is valid UTF-8');
+
+  // Valid UTF-8: 2-byte sequences (Latin, Cyrillic, etc.)
+  assert(asmUtil.utf8Validate(Buffer.from('\u00e9\u00e8\u00ea')), '2-byte chars (accented Latin) are valid');
+
+  // Valid UTF-8: 3-byte sequences (CJK)
+  assert(asmUtil.utf8Validate(Buffer.from('\u3053\u3093\u306b\u3061\u306f')), 'Japanese (3-byte) is valid UTF-8');
+
+  // Valid UTF-8: 4-byte sequences (emoji)
+  assert(asmUtil.utf8Validate(Buffer.from('\ud83c\udf89\ud83d\ude80')), '4-byte emoji is valid UTF-8');
+
+  // Valid UTF-8: mixed ASCII and multi-byte
+  assert(
+    asmUtil.utf8Validate(Buffer.from('Hello \u00e9\u00e8 \u3053\u3093 \ud83c\udf89 World!')),
+    'Mixed ASCII + multi-byte is valid UTF-8'
+  );
+
+  // Valid UTF-8: boundary values
+  assert(asmUtil.utf8Validate(Buffer.from([0x00])), 'U+0000 (NUL) is valid');
+  assert(asmUtil.utf8Validate(Buffer.from([0x7F])), 'U+007F (DEL) is valid');
+  assert(asmUtil.utf8Validate(Buffer.from([0xC2, 0x80])), 'U+0080 is valid');
+  assert(asmUtil.utf8Validate(Buffer.from([0xDF, 0xBF])), 'U+07FF is valid');
+  assert(asmUtil.utf8Validate(Buffer.from([0xE0, 0xA0, 0x80])), 'U+0800 is valid');
+  assert(asmUtil.utf8Validate(Buffer.from([0xEF, 0xBF, 0xBF])), 'U+FFFF is valid');
+  assert(asmUtil.utf8Validate(Buffer.from([0xF0, 0x90, 0x80, 0x80])), 'U+10000 is valid');
+  assert(asmUtil.utf8Validate(Buffer.from([0xF4, 0x8F, 0xBF, 0xBF])), 'U+10FFFF is valid');
+
+  // Valid UTF-8: just below surrogate range
+  assert(asmUtil.utf8Validate(Buffer.from([0xED, 0x9F, 0xBF])), 'U+D7FF (just below surrogates) is valid');
+
+  // Valid UTF-8: just above surrogate range
+  assert(asmUtil.utf8Validate(Buffer.from([0xEE, 0x80, 0x80])), 'U+E000 (just above surrogates) is valid');
+
+  // Invalid: bare continuation byte
+  assert(!asmUtil.utf8Validate(Buffer.from([0x80])), 'Bare continuation byte 0x80 is invalid');
+  assert(!asmUtil.utf8Validate(Buffer.from([0xBF])), 'Bare continuation byte 0xBF is invalid');
+
+  // Invalid: overlong 2-byte encoding (C0 80 = U+0000, C1 BF = U+007F)
+  assert(!asmUtil.utf8Validate(Buffer.from([0xC0, 0x80])), 'Overlong 2-byte (C0 80) is invalid');
+  assert(!asmUtil.utf8Validate(Buffer.from([0xC1, 0xBF])), 'Overlong 2-byte (C1 BF) is invalid');
+
+  // Invalid: overlong 3-byte encoding (E0 80 80 = U+0000)
+  assert(!asmUtil.utf8Validate(Buffer.from([0xE0, 0x80, 0x80])), 'Overlong 3-byte (E0 80 80) is invalid');
+  assert(!asmUtil.utf8Validate(Buffer.from([0xE0, 0x9F, 0xBF])), 'Overlong 3-byte (E0 9F BF) is invalid');
+
+  // Invalid: overlong 4-byte encoding (F0 80 80 80 = U+0000)
+  assert(!asmUtil.utf8Validate(Buffer.from([0xF0, 0x80, 0x80, 0x80])), 'Overlong 4-byte (F0 80 80 80) is invalid');
+  assert(!asmUtil.utf8Validate(Buffer.from([0xF0, 0x8F, 0xBF, 0xBF])), 'Overlong 4-byte (F0 8F BF BF) is invalid');
+
+  // Invalid: surrogates (U+D800-U+DFFF)
+  assert(!asmUtil.utf8Validate(Buffer.from([0xED, 0xA0, 0x80])), 'Surrogate U+D800 is invalid');
+  assert(!asmUtil.utf8Validate(Buffer.from([0xED, 0xAF, 0xBF])), 'Surrogate U+DBFF is invalid');
+  assert(!asmUtil.utf8Validate(Buffer.from([0xED, 0xB0, 0x80])), 'Surrogate U+DC00 is invalid');
+  assert(!asmUtil.utf8Validate(Buffer.from([0xED, 0xBF, 0xBF])), 'Surrogate U+DFFF is invalid');
+
+  // Invalid: out of range (> U+10FFFF)
+  assert(!asmUtil.utf8Validate(Buffer.from([0xF4, 0x90, 0x80, 0x80])), 'Out of range (F4 90 80 80) is invalid');
+  assert(!asmUtil.utf8Validate(Buffer.from([0xF5, 0x80, 0x80, 0x80])), 'Leader byte F5 is invalid');
+  assert(!asmUtil.utf8Validate(Buffer.from([0xFF])), 'Byte 0xFF is invalid');
+  assert(!asmUtil.utf8Validate(Buffer.from([0xFE])), 'Byte 0xFE is invalid');
+
+  // Invalid: truncated sequences
+  assert(!asmUtil.utf8Validate(Buffer.from([0xC2])), 'Truncated 2-byte sequence is invalid');
+  assert(!asmUtil.utf8Validate(Buffer.from([0xE0, 0xA0])), 'Truncated 3-byte sequence is invalid');
+  assert(!asmUtil.utf8Validate(Buffer.from([0xF0, 0x90, 0x80])), 'Truncated 4-byte sequence is invalid');
+  assert(!asmUtil.utf8Validate(Buffer.from([0xF0, 0x90])), 'Truncated 4-byte (2 of 4) is invalid');
+
+  // Invalid: continuation byte where leader expected
+  assert(!asmUtil.utf8Validate(Buffer.from([0xC2, 0x00])), '2-byte with non-continuation (0x00) is invalid');
+  assert(!asmUtil.utf8Validate(Buffer.from([0xC2, 0xC0])), '2-byte with non-continuation (0xC0) is invalid');
+  assert(!asmUtil.utf8Validate(Buffer.from([0xE0, 0xA0, 0x00])), '3-byte with non-continuation is invalid');
+
+  // Invalid embedded in valid: valid...invalid...valid
+  assert(
+    !asmUtil.utf8Validate(Buffer.from([0x41, 0x42, 0x80, 0x43])),
+    'Bare continuation byte embedded in ASCII is invalid'
+  );
+  assert(
+    !asmUtil.utf8Validate(Buffer.from([0x41, 0xED, 0xA0, 0x80, 0x43])),
+    'Surrogate embedded in ASCII is invalid'
+  );
+
+  // Large valid ASCII buffer (exercises SIMD path)
+  {
+    const big = Buffer.alloc(1024, 'A');
+    assert(asmUtil.utf8Validate(big), '1KB all-ASCII is valid (SIMD fast path)');
+  }
+
+  // Large valid ASCII with invalid byte at end (catches SIMD→scalar handoff)
+  {
+    const big = Buffer.alloc(1024, 'A');
+    big[1023] = 0x80;
+    assert(!asmUtil.utf8Validate(big), '1KB ASCII with trailing 0x80 is invalid');
+  }
+
+  // Large valid ASCII with valid multi-byte in the middle
+  {
+    const big = Buffer.alloc(1024, 'A');
+    // Insert valid 3-byte UTF-8 (U+3053: E3 81 93)
+    big[512] = 0xE3; big[513] = 0x81; big[514] = 0x93;
+    assert(asmUtil.utf8Validate(big), '1KB ASCII with valid 3-byte in middle is valid');
+  }
+
+  // Large valid ASCII with truncated multi-byte at very end
+  {
+    const big = Buffer.alloc(1024, 'A');
+    big[1023] = 0xC2;  // 2-byte leader with no continuation
+    assert(!asmUtil.utf8Validate(big), '1KB ASCII with truncated 2-byte at end is invalid');
+  }
+
+  // Cross-reference with TextDecoder for random data
+  {
+    const decoder = new TextDecoder('utf-8', { fatal: true });
+    let crossCheckPassed = 0;
+    let crossCheckTotal = 200;
+    for (let i = 0; i < crossCheckTotal; i++) {
+      const size = 1 + Math.floor(Math.random() * 256);
+      const buf = crypto.randomBytes(size);
+      let expected;
+      try {
+        decoder.decode(buf);
+        expected = true;
+      } catch {
+        expected = false;
+      }
+      const actual = asmUtil.utf8Validate(buf);
+      if (actual === expected) crossCheckPassed++;
+    }
+    assert(
+      crossCheckPassed === crossCheckTotal,
+      `Cross-check vs TextDecoder: ${crossCheckPassed}/${crossCheckTotal} match`
+    );
+  }
+}
+
 // --- Test: cpuFeatures bitmask (if available) ---
 if (typeof asmUtil.cpuFeatures === 'number') {
   console.log('\ncpuFeatures bitmask:');
@@ -432,6 +615,7 @@ if (typeof asmUtil.cpuFeatures === 'number') {
     if (asmUtil.cpuFeatures & 4) bits.push('BMI2');
     if (asmUtil.cpuFeatures & 8)  bits.push('LZCNT');
     if (asmUtil.cpuFeatures & 16) bits.push('VBMI');
+    if (asmUtil.cpuFeatures & 64) bits.push('VBMI2');
     console.log(`  (detected: 0x${asmUtil.cpuFeatures.toString(16).padStart(2,'0')} = [${bits.join(', ') || 'none'}])`);
   }
 }

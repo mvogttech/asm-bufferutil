@@ -195,6 +195,51 @@ for (const { name, size } of sizes) {
   );
 }
 
+// ── GFNI experiment: mask vs maskGfni (AVX-512 VPXORD baseline) ────────────
+
+if (asmUtil?.maskGfni && (asmUtil.cpuFeatures & 1)) {
+  console.log('\n=== GFNI Experiment: mask vs maskGfni ===');
+  console.log('GF2P8AFFINEQB evaluated for XOR masking — cannot replace VPXORD');
+  console.log('for multi-byte patterns (imm8 is 1 byte, mask is 4). Both use VPXORD.');
+  console.log('This benchmark confirms identical performance.\n');
+  console.log(
+    'Size'.padEnd(10) +
+    '  mask ops/s'.padEnd(14) +
+    '  gfni ops/s'.padEnd(14) +
+    '  gfni/mask'.padEnd(11) +
+    '  spread'
+  );
+  console.log('\u2500'.repeat(60));
+
+  const gfniSizes = [
+    { name: '64 B',   size: 64 },
+    { name: '256 B',  size: 256 },
+    { name: '1 KB',   size: 1024 },
+    { name: '16 KB',  size: 16384 },
+    { name: '64 KB',  size: 65536 },
+    { name: '1 MB',   size: 1048576 },
+  ];
+
+  for (const { name, size } of gfniSizes) {
+    const source = crypto.randomBytes(size);
+    const mask   = crypto.randomBytes(4);
+    const output = Buffer.alloc(size);
+
+    collectGarbage();
+    const maskRes = benchmark(() => asmUtil.mask(source, mask, output, 0, size));
+    collectGarbage();
+    const gfniRes = benchmark(() => asmUtil.maskGfni(source, mask, output, 0, size));
+
+    console.log(
+      name.padEnd(10) +
+      fmtOps(maskRes.median) +
+      fmtOps(gfniRes.median) +
+      fmtSpeedup(gfniRes.median, maskRes.median).padStart(11) +
+      ('  ' + fmtRange(gfniRes))
+    );
+  }
+}
+
 // ── Unmask benchmark ────────────────────────────────────────────────────────
 
 console.log('\n=== WebSocket Unmask ===');
@@ -411,6 +456,90 @@ if (asmUtil) {
       fmtOps(jsRes.median) +
       fmtOps(asmRes.median) +
       fmtSpeedup(asmRes.median, jsRes.median).padStart(9) +
+      ('  ' + fmtRange(asmRes))
+    );
+  }
+}
+
+// ── UTF-8 validation benchmark ─────────────────────────────────────────────
+
+if (asmUtil?.utf8Validate) {
+  console.log('\n=== UTF-8 Validation (ASM vs TextDecoder) ===');
+  console.log(
+    'Size'.padEnd(10) +
+    '  TextDecoder'.padEnd(14) +
+    '  ASM ops/s'.padEnd(14) +
+    '  ASM MB/s'.padEnd(12) +
+    '  vs TD'.padEnd(9) +
+    '  spread'
+  );
+  console.log('\u2500'.repeat(70));
+
+  const decoder = new TextDecoder('utf-8', { fatal: true });
+
+  // ASCII text (fast path — the common case for English WebSocket traffic)
+  const asciiSizes = [
+    { name: '64 B',   size: 64 },
+    { name: '256 B',  size: 256 },
+    { name: '1 KB',   size: 1024 },
+    { name: '16 KB',  size: 16384 },
+    { name: '64 KB',  size: 65536 },
+    { name: '256 KB', size: 262144 },
+    { name: '1 MB',   size: 1048576 },
+  ];
+
+  console.log('  -- ASCII text (SIMD fast path) --');
+  for (const { name, size } of asciiSizes) {
+    // Fill with printable ASCII (0x20-0x7E)
+    const data = Buffer.alloc(size);
+    for (let i = 0; i < size; i++) data[i] = 0x20 + (i % 95);
+
+    collectGarbage();
+    const tdRes = benchmark(() => { try { decoder.decode(data); } catch {} });
+    collectGarbage();
+    const asmRes = benchmark(() => asmUtil.utf8Validate(data));
+
+    console.log(
+      name.padEnd(10) +
+      fmtOps(tdRes.median) +
+      fmtOps(asmRes.median) +
+      fmtThroughput(asmRes.median, size).padStart(12) +
+      fmtSpeedup(asmRes.median, tdRes.median).padStart(9) +
+      ('  ' + fmtRange(asmRes))
+    );
+  }
+
+  // Mixed UTF-8 text (Japanese — 3-byte sequences, forces scalar validation)
+  const mixedText = '\u3053\u3093\u306b\u3061\u306f\u4e16\u754c'; // "こんにちは世界"
+  const mixedSizes = [
+    { name: '64 B',   size: 64 },
+    { name: '256 B',  size: 256 },
+    { name: '1 KB',   size: 1024 },
+    { name: '16 KB',  size: 16384 },
+  ];
+
+  console.log('  -- Mixed UTF-8 (Japanese, 3-byte sequences) --');
+  for (const { name, size } of mixedSizes) {
+    const base = Buffer.from(mixedText.repeat(Math.ceil(size / 21)));
+    const data = base.subarray(0, size);
+    // Ensure we don't end on a truncated sequence — trim to valid boundary
+    let trimmed = data;
+    while (trimmed.length > 0) {
+      try { decoder.decode(trimmed); break; } catch { trimmed = trimmed.subarray(0, trimmed.length - 1); }
+    }
+    if (trimmed.length === 0) continue;
+
+    collectGarbage();
+    const tdRes = benchmark(() => { try { decoder.decode(trimmed); } catch {} });
+    collectGarbage();
+    const asmRes = benchmark(() => asmUtil.utf8Validate(trimmed));
+
+    console.log(
+      name.padEnd(10) +
+      fmtOps(tdRes.median) +
+      fmtOps(asmRes.median) +
+      fmtThroughput(asmRes.median, trimmed.length).padStart(12) +
+      fmtSpeedup(asmRes.median, tdRes.median).padStart(9) +
       ('  ' + fmtRange(asmRes))
     );
   }

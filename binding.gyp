@@ -50,6 +50,14 @@
               "action": ["nasm", "-f", "elf64",
                          "-o", "<(INTERMEDIATE_DIR)/ws_crc32_asm.o",
                          "src/ws_crc32_asm.asm"]
+            },
+            {
+              "action_name": "assemble_utf8",
+              "inputs":  ["src/ws_utf8_asm.asm"],
+              "outputs": ["<(INTERMEDIATE_DIR)/ws_utf8_asm.o"],
+              "action": ["nasm", "-f", "elf64",
+                         "-o", "<(INTERMEDIATE_DIR)/ws_utf8_asm.o",
+                         "src/ws_utf8_asm.asm"]
             }
           ],
           "link_settings": {
@@ -57,7 +65,8 @@
               "<(INTERMEDIATE_DIR)/ws_cpu.o",
               "<(INTERMEDIATE_DIR)/ws_mask_asm.o",
               "<(INTERMEDIATE_DIR)/ws_base64_asm.o",
-              "<(INTERMEDIATE_DIR)/ws_crc32_asm.o"
+              "<(INTERMEDIATE_DIR)/ws_crc32_asm.o",
+              "<(INTERMEDIATE_DIR)/ws_utf8_asm.o"
             ]
           }
         }]

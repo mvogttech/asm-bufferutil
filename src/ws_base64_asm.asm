@@ -1,4 +1,4 @@
-; ws_base64_asm.asm — Base64 encoder with AVX2/GFNI/SSE2/scalar dispatch
+; ws_base64_asm.asm — Base64 encoder with AVX-512 VBMI2/VBMI/AVX2/SSE2/scalar dispatch
 ;
 ; C signature:
 ;   size_t ws_base64_encode(const uint8_t *in, size_t len, uint8_t *out);
@@ -12,10 +12,11 @@
 ;   rax = number of output bytes written (always ceil(len/3)*4)
 ;
 ; Dispatch order (fastest-available first):
-;   1. cpu_tier >= 3 + VBMI (bit 4) -> .avx512vbmi_path (24 in -> 32 out / iter, VPERMB)
-;   2. cpu_tier >= 2 (AVX2)         -> .avx2_path        (24 in -> 32 out / iter)
-;   3. cpu_tier >= 1 (SSE2)         -> .sse2_path         (12 in -> 16 out / iter)
-;   4. fallback                     -> .scalar_path        ( 3 in ->  4 out / iter)
+;   1. cpu_tier >= 3 + VBMI2 (bit 6) -> .avx512vbmi2_path (24 in -> 32 out / iter, VPMULTISHIFTQB)
+;   2. cpu_tier >= 3 + VBMI  (bit 4) -> .avx512vbmi_path  (24 in -> 32 out / iter, VPERMB)
+;   3. cpu_tier >= 2 (AVX2)          -> .avx2_path         (24 in -> 32 out / iter)
+;   4. cpu_tier >= 1 (SSE2)          -> .sse2_path          (12 in -> 16 out / iter)
+;   5. fallback                      -> .scalar_path         ( 3 in ->  4 out / iter)
 ;
 ; Algorithm: Klomp/Muła VPSHUFB method (vectorised base64 encoding)
 ;
@@ -186,6 +187,31 @@ section .data
     b64_const_p03:  times 32 db 3      ; +3  correction ('+'->'/' boundary)
 
     ; -------------------------------------------------------------------------
+    ; VPMULTISHIFTQB shift control for VBMI2 base64 path.
+    ; After VPSHUFB with b64_shuf, each dword contains [B, A, C, B] where
+    ; A,B,C are consecutive input bytes.  In a qword (two groups), the
+    ; layout is [B0,A0,C0,B0, B1,A1,C1,B1] at bit positions:
+    ;   B0=[7:0], A0=[15:8], C0=[23:16], B0'=[31:24],
+    ;   B1=[39:32], A1=[47:40], C1=[55:48], B1'=[63:56]
+    ;
+    ; VPMULTISHIFTQB extracts 8 contiguous bits starting at each control byte's
+    ; position (mod 64).  After AND 0x3F the result is the 6-bit base64 index.
+    ;
+    ; Per group [A,B,C]:
+    ;   i0 = A >> 2           -> bits [15:10] -> shift = 10
+    ;   i1 = (A&3)<<4 | B>>4 -> bits [11:4]  -> shift = 4  (& 0x3F)
+    ;   i2 = (B&F)<<2 | C>>6 -> bits [29:22] -> shift = 22 (& 0x3F)
+    ;   i3 = C & 0x3F        -> bits [21:16] -> shift = 16
+    ;
+    ; Group 1 offsets are +32 within the qword.
+    align 32
+    b64_vbmi2_shifts:
+        db 10, 4, 22, 16, 42, 36, 54, 48
+        db 10, 4, 22, 16, 42, 36, 54, 48
+        db 10, 4, 22, 16, 42, 36, 54, 48
+        db 10, 4, 22, 16, 42, 36, 54, 48
+
+    ; -------------------------------------------------------------------------
     ; Standard 64-character base64 alphabet (RFC 4648 §4).
     align 64
     b64_table:
@@ -226,7 +252,9 @@ ws_base64_encode:
     ; ------------------------------------------------------------------
     cmp  dword [cpu_tier], 3
     jl   .b64_check_avx2
-    test dword [cpu_features], (1 << 4)   ; VBMI bit
+    test dword [cpu_features], (1 << 6)   ; VBMI2 bit
+    jnz  .avx512vbmi2_path
+    test dword [cpu_features], (1 << 4)   ; VBMI bit (fallback)
     jnz  .avx512vbmi_path
 
 .b64_check_avx2:
@@ -236,6 +264,62 @@ ws_base64_encode:
     cmp  dword [cpu_tier], 1
     jge  .sse2_path
 
+    jmp  .scalar_path
+
+
+; ============================================================================
+; AVX-512 VBMI2 PATH — 24 input bytes -> 32 output characters per iteration
+;
+; Replaces the 6-instruction Klomp/Mula extraction pipeline with 2 instructions:
+;   VPMULTISHIFTQB — extracts 8 arbitrary bit-fields per qword in one uop
+;   VPANDD         — isolates the 6-bit indices (mask with 0x3F)
+;
+; The existing b64_shuf table produces [B,A,C,B] per dword.  Within each qword
+; (two groups), VPMULTISHIFTQB with control [10,4,22,16, 42,36,54,48] extracts
+; the four 6-bit base64 indices per group directly.
+;
+; After extraction, VPERMB maps 6-bit indices to ASCII via b64_table (same as
+; the VBMI path below).  Net savings: 4 instructions per iteration vs VBMI path.
+;
+; Requires: AVX-512 VBMI2 (cpu_tier >= 3, cpu_features bit 6)
+; ============================================================================
+    align 32
+.avx512vbmi2_path:
+    vmovdqa64  zmm9, [b64_table]          ; 64-byte base64 LUT
+    vmovdqa    ymm10, [b64_vbmi2_shifts]  ; shift control vector (32 bytes)
+    vmovdqa    ymm11, [b64_mask3f]        ; 0x3F mask (32 bytes, pre-filled)
+
+    align 32
+.avx512vbmi2_loop:
+    ; Guard: need 32 bytes for safe overlapping load (consume 24).
+    mov  rax, r13
+    sub  rax, r15
+    cmp  rax, 32
+    jl   .avx512vbmi2_tail
+
+    ; ---- Step 1: Load 24 bytes via two 16-byte lane-aligned loads ----
+    vmovdqu     xmm0, [r12 + r15]
+    vinserti128 ymm0, ymm0, [r12 + r15 + 12], 1
+
+    ; ---- Step 2: Shuffle to [B,A,C,B] per dword ----
+    vpshufb    ymm0, ymm0, [b64_shuf]
+
+    ; ---- Step 3: Extract 6-bit fields (replaces 6-instruction pipeline) ----
+    vpmultishiftqb ymm1, ymm10, ymm0     ; extract 8 bit-fields per qword
+    vpand      ymm1, ymm1, ymm11         ; isolate 6-bit indices
+
+    ; ---- Step 4: Map index -> ASCII via VPERMB ----
+    vpermb     zmm1, zmm1, zmm9          ; zmm1[i] = b64_table[ymm1[i] & 63]
+
+    ; ---- Step 5: Store 32 output bytes ----
+    vmovdqu    [r14 + rbx], ymm1
+
+    add  r15, 24
+    add  rbx, 32
+    jmp  .avx512vbmi2_loop
+
+.avx512vbmi2_tail:
+    SAFE_VZEROUPPER
     jmp  .scalar_path
 
 

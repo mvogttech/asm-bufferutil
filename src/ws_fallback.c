@@ -59,9 +59,11 @@
 /* ── CPU feature state ────────────────────────────────────────────────────── */
 
 /* cpu_features bitmask (matches ws_cpu.asm layout):
- *   bit 0 = GFNI, bit 1 = PCLMULQDQ, bit 2 = BMI2, bit 3 = LZCNT
+ *   bit 0 = GFNI, bit 1 = PCLMULQDQ, bit 2 = BMI2, bit 3 = LZCNT,
+ *   bit 4 = VBMI, bit 5 = AMD, bit 6 = VBMI2
  */
 uint32_t cpu_features = 0;
+uint32_t cpu_tier = 0;  /* 0 = scalar only; assembly sets 1/2/3 on Linux */
 
 /* ── Internal XOR implementations ────────────────────────────────────────── */
 /*
@@ -294,6 +296,31 @@ void ws_unmask(uint8_t *buf, const uint8_t *mask_ptr, size_t length) {
     xor_impl(buf, buf, mask_ptr, mask32, length);
 }
 
+/* ── ws_unmask4 / ws_mask4 — multi-buffer batch (fallback: loop) ─────────── */
+
+void ws_unmask4(uint8_t *data, const uint32_t *offsets,
+                const uint32_t *lengths, const uint8_t *masks,
+                uint32_t count) {
+    for (uint32_t i = 0; i < count; i++) {
+        ws_unmask(data + offsets[i], masks + i * 4, lengths[i]);
+    }
+}
+
+void ws_mask4(const uint8_t *src, uint8_t *dst,
+              const uint32_t *offsets, const uint32_t *lengths,
+              const uint8_t *masks, uint32_t count) {
+    for (uint32_t i = 0; i < count; i++) {
+        ws_mask(src + offsets[i], masks + i * 4,
+                dst + offsets[i], 0, lengths[i]);
+    }
+}
+
+/* ws_mask_gfni — GFNI experiment baseline (delegates to ws_mask on fallback) */
+void ws_mask_gfni(const uint8_t *src, const uint8_t *mask_ptr,
+                  uint8_t *out, size_t offset, size_t length) {
+    ws_mask(src, mask_ptr, out, offset, length);
+}
+
 /* ── ws_find_header ───────────────────────────────────────────────────────── */
 
 int64_t ws_find_header(const uint8_t *buf, size_t len,
@@ -305,6 +332,61 @@ int64_t ws_find_header(const uint8_t *buf, size_t len,
             return (int64_t)(i + needle_len);
     }
     return -1;
+}
+
+/* ── ws_utf8_validate ─────────────────────────────────────────────────────── */
+
+int ws_utf8_validate(const uint8_t *buf, size_t len) {
+    size_t i = 0;
+    while (i < len) {
+        uint8_t b = buf[i];
+
+        if (b < 0x80) {
+            /* ASCII fast scan: skip ahead while bytes are < 0x80 */
+            i++;
+            while (i < len && buf[i] < 0x80) i++;
+            continue;
+        }
+
+        uint32_t codepoint;
+        size_t extra;  /* number of continuation bytes expected */
+
+        if (b < 0xC2) {
+            return 0;  /* 0x80-0xC1: bare continuation or overlong 2-byte */
+        } else if (b <= 0xDF) {
+            codepoint = b & 0x1F;
+            extra = 1;
+        } else if (b <= 0xEF) {
+            codepoint = b & 0x0F;
+            extra = 2;
+        } else if (b <= 0xF4) {
+            codepoint = b & 0x07;
+            extra = 3;
+        } else {
+            return 0;  /* 0xF5-0xFF: invalid */
+        }
+
+        i++;
+
+        /* Read continuation bytes */
+        for (size_t j = 0; j < extra; j++) {
+            if (i >= len) return 0;  /* truncated sequence */
+            uint8_t c = buf[i];
+            if ((c & 0xC0) != 0x80) return 0;  /* not a continuation byte */
+
+            /* First continuation byte range checks */
+            if (j == 0) {
+                if (b == 0xE0 && c < 0xA0) return 0;  /* overlong 3-byte */
+                if (b == 0xED && c >= 0xA0) return 0;  /* surrogate */
+                if (b == 0xF0 && c < 0x90) return 0;   /* overlong 4-byte */
+                if (b == 0xF4 && c >= 0x90) return 0;   /* > U+10FFFF */
+            }
+
+            codepoint = (codepoint << 6) | (c & 0x3F);
+            i++;
+        }
+    }
+    return 1;
 }
 
 /* ── ws_base64_encode ─────────────────────────────────────────────────────── */
