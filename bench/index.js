@@ -145,7 +145,10 @@ function fmtRange(result) {
 
 const sizes = [
   { name: '64 B',   size: 64 },
+  { name: '128 B',  size: 128 },     // GPR→SIMD boundary
   { name: '256 B',  size: 256 },
+  { name: '384 B',  size: 384 },     // mid-SIMD transition zone
+  { name: '512 B',  size: 512 },
   { name: '1 KB',   size: 1024 },
   { name: '16 KB',  size: 16384 },
   { name: '64 KB',  size: 65536 },

@@ -60,6 +60,7 @@ ws_mask:
 
     ; ==================== GPR FAST PATH (< 128 bytes) ====================
     ; Avoids SIMD setup overhead for small WebSocket frames (control, etc.)
+    ; 4x unrolled (32 bytes/iter) with offset addressing to reduce loop overhead
     cmp rcx, 128
     jae .m_dispatch_simd
 
@@ -67,8 +68,36 @@ ws_mask:
     shl r9, 32
     or  r9, r8
 
+    ; 4x unrolled: 32 bytes per iteration
     mov rax, rcx
-    shr rax, 3                  ; 8-byte chunks
+    shr rax, 5                  ; 32-byte chunks
+    test rax, rax
+    jz .m_gpr8_rem
+
+    align 16
+.m_gpr32:
+    mov r10, [rdi]
+    mov r11, [rdi + 8]
+    xor r10, r9
+    xor r11, r9
+    mov [rdx], r10
+    mov [rdx + 8], r11
+    mov r10, [rdi + 16]
+    mov r11, [rdi + 24]
+    xor r10, r9
+    xor r11, r9
+    mov [rdx + 16], r10
+    mov [rdx + 24], r11
+    add rdi, 32
+    add rdx, 32
+    dec rax
+    jnz .m_gpr32
+
+    and rcx, 31
+
+.m_gpr8_rem:
+    mov rax, rcx
+    shr rax, 3                  ; remaining 8-byte chunks (0-3)
     test rax, rax
     jz .m_scalar
 
@@ -446,6 +475,7 @@ ws_unmask:
     mov r8d, [rsi]
 
     ; ==================== GPR FAST PATH (< 128 bytes) ====================
+    ; 4x unrolled (32 bytes/iter) with interleaved loads for ILP
     cmp rcx, 128
     jae .u_dispatch_simd
 
@@ -453,8 +483,35 @@ ws_unmask:
     shl r9, 32
     or  r9, r8
 
+    ; 4x unrolled: 32 bytes per iteration
     mov rax, rcx
-    shr rax, 3
+    shr rax, 5                  ; 32-byte chunks
+    test rax, rax
+    jz .u_gpr8_rem
+
+    align 16
+.u_gpr32:
+    mov r10, [rdi]
+    mov r11, [rdi + 8]
+    xor r10, r9
+    xor r11, r9
+    mov [rdi], r10
+    mov [rdi + 8], r11
+    mov r10, [rdi + 16]
+    mov r11, [rdi + 24]
+    xor r10, r9
+    xor r11, r9
+    mov [rdi + 16], r10
+    mov [rdi + 24], r11
+    add rdi, 32
+    dec rax
+    jnz .u_gpr32
+
+    and rcx, 31
+
+.u_gpr8_rem:
+    mov rax, rcx
+    shr rax, 3                  ; remaining 8-byte chunks (0-3)
     test rax, rax
     jz .u_scalar
 
