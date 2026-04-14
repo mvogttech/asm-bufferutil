@@ -1,12 +1,17 @@
-/* ws_sha1_ni.c — SHA-1 with Intel SHA-NI
+/* ws_sha1_ni.c — SHA-1 with Intel SHA-NI + portable C fallback
  * Re-derived from Intel whitepaper, counting exactly 20 sha1rnds4 calls.
  * Pattern: E0/E1 ping-pong, msg schedule runs from rounds 4-55.
+ *
+ * The portable fallback is used when SHA-NI is unavailable or when MSVC
+ * generates broken code for the SHA-NI intrinsics (validated at runtime).
  */
 #include <stdint.h>
 #include <string.h>
-#include <immintrin.h>
+
+/* ── CPU feature detection ─────────────────────────────────────────── */
 
 #ifdef _MSC_VER
+#include <intrin.h>
 int ws_has_sha_ni(void) {
     int info[4];
     __cpuidex(info, 7, 0);
@@ -20,6 +25,58 @@ int ws_has_sha_ni(void) {
     return 0;
 }
 #endif
+
+/* ── Portable SHA-1 (RFC 3174) ─────────────────────────────────────── */
+
+static uint32_t rol32(uint32_t x, int n) { return (x << n) | (x >> (32-n)); }
+
+static void sha1_portable_block(uint32_t state[5], const uint8_t data[64]) {
+    uint32_t W[80];
+    for (int i = 0; i < 16; i++)
+        W[i] = ((uint32_t)data[i*4]<<24) | ((uint32_t)data[i*4+1]<<16) |
+               ((uint32_t)data[i*4+2]<<8) | data[i*4+3];
+    for (int i = 16; i < 80; i++)
+        W[i] = rol32(W[i-3] ^ W[i-8] ^ W[i-14] ^ W[i-16], 1);
+
+    uint32_t a=state[0], b=state[1], c=state[2], d=state[3], e=state[4];
+    for (int i = 0; i < 80; i++) {
+        uint32_t f, k;
+        if      (i < 20) { f = (b&c) ^ (~b&d);          k = 0x5A827999; }
+        else if (i < 40) { f = b^c^d;                    k = 0x6ED9EBA1; }
+        else if (i < 60) { f = (b&c) ^ (b&d) ^ (c&d);   k = 0x8F1BBCDC; }
+        else              { f = b^c^d;                    k = 0xCA62C1D6; }
+        uint32_t t = rol32(a,5) + f + e + k + W[i];
+        e=d; d=c; c=rol32(b,30); b=a; a=t;
+    }
+    state[0]+=a; state[1]+=b; state[2]+=c; state[3]+=d; state[4]+=e;
+}
+
+static void sha1_portable(const uint8_t *msg, size_t len, uint8_t out[20]) {
+    uint8_t padded[128];
+    memset(padded, 0, len <= 55 ? 64 : 128);
+    if (len) memcpy(padded, msg, len);
+    padded[len] = 0x80;
+    int nblocks;
+    if (len <= 55) {
+        nblocks = 1;
+        uint64_t bits = (uint64_t)len << 3;
+        for (int i = 0; i < 8; i++) padded[63-i] = (uint8_t)(bits >> (i*8));
+    } else {
+        nblocks = 2;
+        uint64_t bits = (uint64_t)len << 3;
+        for (int i = 0; i < 8; i++) padded[127-i] = (uint8_t)(bits >> (i*8));
+    }
+    uint32_t state[5] = {0x67452301,0xEFCDAB89,0x98BADCFE,0x10325476,0xC3D2E1F0};
+    for (int b = 0; b < nblocks; b++) sha1_portable_block(state, padded + b*64);
+    for (int i = 0; i < 5; i++) {
+        out[i*4+0]=(uint8_t)(state[i]>>24); out[i*4+1]=(uint8_t)(state[i]>>16);
+        out[i*4+2]=(uint8_t)(state[i]>>8);  out[i*4+3]=(uint8_t)(state[i]);
+    }
+}
+
+/* ── SHA-NI accelerated path ───────────────────────────────────────── */
+
+#include <immintrin.h>
 
 static void sha1_ni_block(uint32_t state[5], const uint8_t data[64]) {
     __m128i ABCD, ABCD_SAVE, E0, E0_SAVE, E1;
@@ -89,7 +146,7 @@ static void sha1_ni_block(uint32_t state[5], const uint8_t data[64]) {
     state[4] = (uint32_t)_mm_extract_epi32(E0, 3);
 }
 
-void ws_sha1_ni(const uint8_t *msg, size_t len, uint8_t out[20]) {
+static void sha1_ni(const uint8_t *msg, size_t len, uint8_t out[20]) {
     uint8_t padded[128];
     memset(padded, 0, len <= 55 ? 64 : 128);
     if (len) memcpy(padded, msg, len);
@@ -110,4 +167,30 @@ void ws_sha1_ni(const uint8_t *msg, size_t len, uint8_t out[20]) {
         out[i*4+0]=(uint8_t)(state[i]>>24); out[i*4+1]=(uint8_t)(state[i]>>16);
         out[i*4+2]=(uint8_t)(state[i]>>8);  out[i*4+3]=(uint8_t)(state[i]);
     }
+}
+
+/* ── Runtime dispatch: validate SHA-NI, fall back to portable ──────── */
+
+/* SHA-1("abc") = a9993e36 4706816a ba3e2571 7850c26c 9cd0d89d */
+static const uint8_t sha1_abc_expected[20] = {
+    0xa9,0x99,0x3e,0x36,0x47,0x06,0x81,0x6a,0xba,0x3e,
+    0x25,0x71,0x78,0x50,0xc2,0x6c,0x9c,0xd0,0xd8,0x9d
+};
+
+static int sha_ni_ok = -1; /* -1 = untested, 0 = broken, 1 = working */
+
+void ws_sha1_ni(const uint8_t *msg, size_t len, uint8_t out[20]) {
+    if (sha_ni_ok == -1) {
+        if (ws_has_sha_ni()) {
+            uint8_t test[20];
+            sha1_ni((const uint8_t*)"abc", 3, test);
+            sha_ni_ok = (memcmp(test, sha1_abc_expected, 20) == 0);
+        } else {
+            sha_ni_ok = 0;
+        }
+    }
+    if (sha_ni_ok)
+        sha1_ni(msg, len, out);
+    else
+        sha1_portable(msg, len, out);
 }
