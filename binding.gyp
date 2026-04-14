@@ -17,6 +17,18 @@
             }
           }
         }],
+        ["OS!='win' and target_arch=='x64'", {
+          "cflags": ["-Wall", "-O2", "-mssse3", "-msse4.1", "-msha", "-mgfni"],
+          "xcode_settings": {
+            "OTHER_CFLAGS": ["-Wall", "-O2", "-mssse3", "-msse4.1", "-msha", "-mgfni"]
+          }
+        }],
+        ["OS!='win' and target_arch!='x64'", {
+          "cflags": ["-Wall", "-O2"],
+          "xcode_settings": {
+            "OTHER_CFLAGS": ["-Wall", "-O2"]
+          }
+        }],
         ["OS=='linux' and target_arch=='x64'", {
           "actions": [
             {
@@ -71,7 +83,6 @@
           }
         }]
       ],
-      "cflags": ["-Wall", "-O2", "-mssse3", "-msse4.1", "-msha", "-mgfni"],
       "defines": ["NAPI_VERSION=9"]
     }
   ]
