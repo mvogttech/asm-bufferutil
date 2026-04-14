@@ -16,6 +16,7 @@
 ;   PCMPISTRI xmm, m, im — string comparison (SSE4.2)
 ;   PREFETCHT0           — temporal prefetch into all cache levels (cached path)
 ;   PREFETCHNTA          — non-temporal prefetch (NT-store path only)
+;   VMOVNTDQA            — non-temporal load hint (NT unmask path, rdi aligned)
 ;   VMOVNTDQ             — non-temporal store (cache-bypass)
 ;   REP MOVSB            — fast memcpy (ERMS/FSRM)
 ;
@@ -750,10 +751,10 @@ ws_unmask:
     align 32
 .u_nt512_loop:
     prefetchnta [rdi + 1024]
-    vmovdqu64 zmm1, [rdi]
-    vmovdqu64 zmm2, [rdi + 64]
-    vmovdqu64 zmm3, [rdi + 128]
-    vmovdqu64 zmm4, [rdi + 192]
+    vmovntdqa zmm1, [rdi]          ; NT load (rdi 64-byte aligned by prologue)
+    vmovntdqa zmm2, [rdi + 64]
+    vmovntdqa zmm3, [rdi + 128]
+    vmovntdqa zmm4, [rdi + 192]
     vpxord zmm1, zmm1, zmm0
     vpxord zmm2, zmm2, zmm0
     vpxord zmm3, zmm3, zmm0
@@ -890,10 +891,10 @@ ws_unmask:
     align 32
 .u_nt_avx2_loop:
     prefetchnta [rdi + 512]
-    vmovdqu ymm1, [rdi]
-    vmovdqu ymm2, [rdi + 32]
-    vmovdqu ymm3, [rdi + 64]
-    vmovdqu ymm4, [rdi + 96]
+    vmovntdqa ymm1, [rdi]          ; NT load (rdi 32-byte aligned by prologue)
+    vmovntdqa ymm2, [rdi + 32]
+    vmovntdqa ymm3, [rdi + 64]
+    vmovntdqa ymm4, [rdi + 96]
     vpxor ymm1, ymm1, ymm0
     vpxor ymm2, ymm2, ymm0
     vpxor ymm3, ymm3, ymm0
