@@ -107,6 +107,14 @@ DEFAULT REL
 extern cpu_tier
 extern cpu_features
 
+; Skip vzeroupper on AMD (no SSE/AVX transition penalty on Zen).
+%macro SAFE_VZEROUPPER 0
+    test dword [cpu_features], (1 << 5)
+    jnz %%skip
+    vzeroupper
+%%skip:
+%endmacro
+
 ; ============================================================================
 ; .data — lookup tables and broadcast constant vectors
 ; ============================================================================
@@ -370,7 +378,7 @@ ws_base64_encode:
     jmp  .avx512vbmi_loop
 
 .avx512vbmi_tail:
-    vzeroupper
+    SAFE_VZEROUPPER
     jmp  .scalar_path
 
 
@@ -476,7 +484,7 @@ ws_base64_encode:
     ; Clear upper YMM state before using legacy SSE or scalar instructions.
     ; Required to avoid AVX-SSE transition penalties and for correctness when
     ; mixing VEX-encoded and non-VEX-encoded instructions.
-    vzeroupper
+    SAFE_VZEROUPPER
     jmp  .scalar_path              ; handle remaining < 24 bytes
 
 
