@@ -6,10 +6,13 @@
   "files": [
     "src/",
     "index.js",
-    "binding.gyp"
+    "fallback.js",
+    "binding.gyp",
+    "prebuilds/"
   ],
   "scripts": {
-    "install": "node-gyp rebuild",
+    "install": "node-gyp-build",
+    "prebuild": "prebuildify --strip --target=20.0.0 --target=22.0.0 --target=24.0.0",
     "build": "node-gyp rebuild",
     "test": "node test/index.js",
     "bench": "node --expose-gc bench/index.js"
@@ -32,21 +35,25 @@
   },
   "homepage": "https://github.com/mvogttech/asm-bufferutil#readme",
   "dependencies": {
-    "node-gyp": "^12.0.0"
+    "node-gyp-build": "^4.8.0"
   },
   "engines": {
     "node": ">=20.0.0"
   },
   "os": [
     "linux",
-    "win32"
+    "win32",
+    "darwin"
   ],
   "cpu": [
-    "x64"
+    "x64",
+    "arm64"
   ],
   "license": "MIT",
   "devDependencies": {
     "bufferutil": "^4.1.0",
-    "js-yaml": "^4.1.1"
+    "js-yaml": "^4.1.1",
+    "node-gyp": "^12.0.0",
+    "prebuildify": "^6.0.0"
   }
 }
