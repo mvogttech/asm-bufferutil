@@ -5,3 +5,7 @@ package-lock.json
 *.node
 .claude/
 docs/
+
+# Allow prebuilt binaries in prebuilds/ directory
+!prebuilds/
+!prebuilds/**/*.node
