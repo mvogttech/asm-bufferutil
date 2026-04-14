@@ -51,34 +51,19 @@
 ;       Full 16-byte shuffle table:
 ;         1, 0, 2, 1,   4, 3, 5, 4,   7, 6, 8, 7,   10, 9, 11, 10
 ;
-;   Step 2 — Extract high indices (PMADDUBSW with mul_lo = 0x0140, then >> 10):
-;     PMADDUBSW dst, src:  result_word[j] = (dst_even[j] * src_even[j])
-;                                         + (dst_odd[j]  * src_odd[j])
-;     With our shuffle, word j = [B, A] (even=B unsigned, odd=A unsigned).
-;     mul_lo word = 0x0140: even byte = 0x40 (+64 signed), odd byte = 0x01 (+1 signed).
-;     result = B*64 + A*1  (each up to 255*64 = 16320, fits in signed 16-bit)
-;     Shift right by 10: (B*64 + A) >> 10 = (B<<6 + A) >> 10
-;     For the 16-bit range: bits 15..10 give (B*64 + A) / 1024.
-;     The value i0 = A>>2 falls in bits [9:4] of A, and:
-;       (A*4 + B) >> 4  ... hmm, let's cross-check with published values.
+;   Step 2 — Extract 6-bit indices (aklomp mulhi/mullo method):
+;     After shuffle, each dword is [B, A, C, B].  Two pairs of AND+multiply
+;     isolate the even indices (i0, i2) and odd indices (i1, i3):
 ;
-;     Reference (Muła/Klomp): the shuffle used is slightly different from
-;     the naive per-group arrangement.  The published implementation uses:
-;       shuffle: 1,0,2,1, 4,3,5,4, 7,6,8,7, 10,9,11,10
-;       mul_lo = 0x0140 (repeated as 16-bit words)
-;       mul_hi = 0x0801 (repeated as 16-bit words)
-;     After PMADDUBSW with mul_lo and >> 10: 8 "high" indices per 16-byte block
-;     After PMADDUBSW with mul_hi and & 0x3F: 8 "low"  indices per 16-byte block
-;     After PACKUSWB(hi, lo) + re-interleave PSHUFB: 16 indices in correct order.
+;     Even: (dword & 0x0FC0FC00) * 0x04000040  (PMULHUW, takes high 16 bits)
+;       Word [B, A] & 0xFC00 = A[7:2] << 10  →  mulhi shifts down to A >> 2 = i0
+;       Word [C, B] & 0x0FC0 = (B[3:0]<<6|C[7:6]) << 6  →  mulhi gives i2
 ;
-;   Step 3 — Extract low indices (PMADDUBSW with mul_hi = 0x0801, then & 0x3F):
-;     mul_hi word = 0x0801: even byte = 0x01 (+1), odd byte = 0x08 (+8 signed).
-;     result = B*1 + A*8  (for the [B,A] word) or C*1 + B*8 (for [C,B] word)
-;     AND with 0x3F isolates the low 6 bits.
+;     Odd:  (dword & 0x003F03F0) * 0x01000010  (PMULLW, takes low 16 bits)
+;       Word [B, A] & 0x03F0 = (A[1:0]<<4|B[7:4]) << 4  →  mullo shifts to byte 1
+;       Word [C, B] & 0x003F = C[5:0]  →  mullo shifts to byte 3  →  i3
 ;
-;   Step 4 — Pack (PACKUSWB / VPACKUSWB):
-;     Pack 8 hi-index words + 8 lo-index words into 16 bytes.
-;     The packed order is [hi0..hi7, lo0..lo7]; a PSHUFB interleave fixes this.
+;     POR merges them: each byte = one 6-bit index in correct sequential order.
 ;
 ;   Step 5 — Classify (range comparison + offset accumulation):
 ;     Start all 32 (or 16) output bytes with base offset +65 ('A').
@@ -131,35 +116,36 @@ section .data
         db  1, 0, 2, 1,  4, 3, 5, 4,  7, 6, 8, 7, 10, 9,11,10
 
     ; -------------------------------------------------------------------------
-    ; PMADDUBSW multiplier for HIGH indices (i0, i2 per group).
-    ; Each 16-bit word = 0x0140: low byte = 0x40 (+64), high byte = 0x01 (+1).
-    ; After multiply-add and >> 10 the high 6-bit index sits in bits [5:0].
+    ; 6-bit index extraction constants (aklomp mulhi/mullo method).
+    ;
+    ; After VPSHUFB with b64_shuf, each dword is [B, A, C, B] (little-endian).
+    ; The two masks isolate the bit-fields that contribute to even (i0, i2)
+    ; and odd (i1, i3) base64 indices respectively.  PMULHUW/PMULLW shift
+    ; the isolated bits into the correct byte positions so that POR merges
+    ; them into 4 sequential index bytes per dword.
+    ;
+    ; Even indices (i0 = A>>2, i2 = (B&0xF)<<2 | C>>6):
+    ;   mask  0x0FC0FC00  — isolates A[7:2] in word 0, (B[3:0]<<2|C[7:6]) in word 1
+    ;   mulhi 0x04000040  — shifts those fields down to bits [5:0] via high-multiply
+    ;
+    ; Odd indices (i1 = (A&3)<<4 | B>>4, i3 = C & 0x3F):
+    ;   mask  0x003F03F0  — isolates (A[1:0]<<4|B[7:4]) in word 0, C[5:0] in word 1
+    ;   mullo 0x01000010  — shifts those fields up to bits [13:8] via low-multiply
     align 32
-    b64_mul_lo:
-        times 16 dw 0x0140
+    b64_mask_hi:
+        times 8 dd 0x0FC0FC00
 
-    ; PMADDUBSW multiplier for LOW indices (i1, i3 per group).
-    ; Each 16-bit word = 0x0801: low byte = 0x01 (+1), high byte = 0x08 (+8).
-    ; After multiply-add and & 0x3F the low 6-bit index sits in bits [5:0].
     align 32
-    b64_mul_hi:
-        times 16 dw 0x0801
+    b64_mulhi_vec:
+        times 8 dd 0x04000040
 
-    ; -------------------------------------------------------------------------
-    ; Post-pack interleave shuffle (Step 4b).
-    ; After PACKUSWB(hi_words, lo_words) the layout within each 16-byte lane is:
-    ;   [hi0, hi1, hi2, hi3, hi4, hi5, hi6, hi7,
-    ;    lo0, lo1, lo2, lo3, lo4, lo5, lo6, lo7]
-    ; hi indices correspond to output characters 0,2,4,6,8,10,12,14
-    ; lo indices correspond to output characters 1,3,5,7,9,11,13,15
-    ; We interleave to produce the correct sequential order:
-    ;   [hi0,lo0, hi1,lo1, hi2,lo2, hi3,lo3, hi4,lo4, hi5,lo5, hi6,lo6, hi7,lo7]
-    ; i.e. read position i from slot: hi at i/2 (even i), lo at 8 + i/2 (odd i).
-    ; Shuffle bytes: 0,8, 1,9, 2,10, 3,11, 4,12, 5,13, 6,14, 7,15
     align 32
-    b64_pack_shuf:
-        db  0, 8, 1, 9, 2,10, 3,11, 4,12, 5,13, 6,14, 7,15
-        db  0, 8, 1, 9, 2,10, 3,11, 4,12, 5,13, 6,14, 7,15
+    b64_mask_lo:
+        times 8 dd 0x003F03F0
+
+    align 32
+    b64_mullo_vec:
+        times 8 dd 0x01000010
 
     ; -------------------------------------------------------------------------
     ; 0x3F mask used to isolate 6-bit indices from PMADDUBSW with mul_hi.
@@ -354,17 +340,18 @@ ws_base64_encode:
     cmp  rax, 32
     jl   .avx512vbmi_tail
 
-    ; ---- Steps 1-4: identical to AVX2 path ----
+    ; ---- Steps 1-3: load, shuffle, extract 6-bit indices ----
     ; Same two-load fix: high lane must contain bytes [r15+12..r15+23].
     vmovdqu     xmm0, [r12 + r15]
     vinserti128 ymm0, ymm0, [r12 + r15 + 12], 1
     vpshufb    ymm0, ymm0, [b64_shuf]
-    vpmaddubsw ymm1, ymm0, [b64_mul_lo]
-    vpsrlw     ymm1, ymm1, 10
-    vpmaddubsw ymm2, ymm0, [b64_mul_hi]
-    vpand      ymm2, ymm2, [b64_mask3f]
-    vpackuswb  ymm3, ymm1, ymm2
-    vpshufb    ymm3, ymm3, [b64_pack_shuf]   ; ymm3 = 32 six-bit indices (0-63)
+
+    ; Extract indices via mulhi/mullo (aklomp method)
+    vpand      ymm1, ymm0, [b64_mask_hi]
+    vpmulhuw   ymm1, ymm1, [b64_mulhi_vec]
+    vpand      ymm2, ymm0, [b64_mask_lo]
+    vpmullw    ymm2, ymm2, [b64_mullo_vec]
+    vpor       ymm3, ymm1, ymm2              ; ymm3 = 32 six-bit indices (0-63)
 
     ; ---- Steps 5+6: map 6-bit index -> ASCII in one instruction ----
     ; vpermb dst, idx, src — for each byte i: dst[i] = src[idx[i] & 63]
@@ -434,17 +421,12 @@ ws_base64_encode:
     ; ---- Step 2: Shuffle bytes for 6-bit extraction ----
     vpshufb ymm0, ymm0, [b64_shuf]
 
-    ; ---- Step 3a: Extract high indices (i0, i2 for each group) ----
-    vpmaddubsw ymm1, ymm0, [b64_mul_lo]
-    vpsrlw     ymm1, ymm1, 10      ; shift >> 10 leaves 6-bit index in low bits
-
-    ; ---- Step 3b: Extract low indices (i1, i3 for each group) ----
-    vpmaddubsw ymm2, ymm0, [b64_mul_hi]
-    vpand      ymm2, ymm2, [b64_mask3f]
-
-    ; ---- Step 4: Pack words to bytes, then interleave hi/lo ----
-    vpackuswb  ymm3, ymm1, ymm2    ; [hi0..hi7|lo0..lo7] per 128-bit lane
-    vpshufb    ymm3, ymm3, [b64_pack_shuf]  ; interleave -> correct sequential order
+    ; ---- Steps 3-4: Extract 6-bit indices via mulhi/mullo (aklomp method) ----
+    vpand      ymm1, ymm0, [b64_mask_hi]
+    vpmulhuw   ymm1, ymm1, [b64_mulhi_vec]
+    vpand      ymm2, ymm0, [b64_mask_lo]
+    vpmullw    ymm2, ymm2, [b64_mullo_vec]
+    vpor       ymm3, ymm1, ymm2              ; 32 six-bit indices in correct byte order
 
     ; ---- Step 5: Classify — build per-byte ASCII offset vector ----
     ; Start with base offset +65 for every output byte position.
@@ -523,21 +505,14 @@ ws_base64_encode:
     movdqu    xmm0, [r12 + r15]
     pshufb    xmm0, [b64_shuf]
 
-    ; ---- Step 3a: Extract high indices ----
+    ; ---- Steps 3-4: Extract 6-bit indices via mulhi/mullo (aklomp method) ----
     movdqa    xmm1, xmm0
-    pmaddubsw xmm1, [b64_mul_lo]
-    psrlw     xmm1, 10
-
-    ; ---- Step 3b: Extract low indices ----
+    pand      xmm1, [b64_mask_hi]
+    pmulhuw   xmm1, [b64_mulhi_vec]
     movdqa    xmm2, xmm0
-    pmaddubsw xmm2, [b64_mul_hi]
-    pand      xmm2, [b64_mask3f]
-
-    ; ---- Step 4: Pack and interleave ----
-    packuswb  xmm1, xmm2
-    pshufb    xmm1, [b64_pack_shuf]
-
-    ; xmm1 = 16 six-bit indices in correct output order.
+    pand      xmm2, [b64_mask_lo]
+    pmullw    xmm2, [b64_mullo_vec]
+    por       xmm1, xmm2             ; xmm1 = 16 six-bit indices in correct order
 
     ; ---- Step 5: Build offset vector ----
     movdqa    xmm4, xmm14           ; offset = +65
