@@ -620,49 +620,39 @@ ws_unmask:
     vpbroadcastd zmm0, r8d
 
 .u_512_aligned:
-    ; Dual-stream: process 256 bytes from front + 256 from back per iteration.
-    ; Two independent memory streams increase page-level parallelism and
-    ; TLB coverage for large in-place buffers.
+    ; 8x unrolled: 512 bytes/iter (rdi now 64-byte aligned, in-place)
     mov rax, rcx
     shr rax, 9                  ; iterations = len / 512
     jz .u_512_tail
 
-    lea r11, [rdi + rcx - 256]  ; r11 = back pointer (last 256-byte block)
-
     align 32
-.u_dual_512:
-    ; Memory-operand VPXORD fuses load+XOR; OoO engine overlaps stores naturally.
-    prefetcht0 [rdi + 1024]
-    prefetcht0 [r11 - 768]
+.u_512_512:
+    ; 8x unrolled: memory-operand VPXORD fuses load+XOR into one instruction.
+    ; OoO engine (Zen 4: 320-entry ROB) overlaps loads and stores naturally.
+    prefetcht0 [rdi + 2048]
 
-    ; Front 256 bytes
     vpxord zmm1, zmm0, [rdi]
     vpxord zmm2, zmm0, [rdi + 64]
     vpxord zmm3, zmm0, [rdi + 128]
     vpxord zmm4, zmm0, [rdi + 192]
+    vpxord zmm5, zmm0, [rdi + 256]
+    vpxord zmm6, zmm0, [rdi + 320]
+    vpxord zmm7, zmm0, [rdi + 384]
+    vpxord zmm8, zmm0, [rdi + 448]
     vmovdqu64 [rdi], zmm1
     vmovdqu64 [rdi + 64], zmm2
     vmovdqu64 [rdi + 128], zmm3
     vmovdqu64 [rdi + 192], zmm4
+    vmovdqu64 [rdi + 256], zmm5
+    vmovdqu64 [rdi + 320], zmm6
+    vmovdqu64 [rdi + 384], zmm7
+    vmovdqu64 [rdi + 448], zmm8
 
-    ; Back 256 bytes
-    vpxord zmm5, zmm0, [r11]
-    vpxord zmm6, zmm0, [r11 + 64]
-    vpxord zmm7, zmm0, [r11 + 128]
-    vpxord zmm8, zmm0, [r11 + 192]
-    vmovdqu64 [r11], zmm5
-    vmovdqu64 [r11 + 64], zmm6
-    vmovdqu64 [r11 + 128], zmm7
-    vmovdqu64 [r11 + 192], zmm8
-
-    add rdi, 256
-    sub r11, 256
+    add rdi, 512
     dec rax
-    jnz .u_dual_512
+    jnz .u_512_512
 
-    ; Remaining middle bytes: (r11 + 256) - rdi
-    lea rcx, [r11 + 256]
-    sub rcx, rdi
+    and rcx, 511
 
 .u_512_tail:
     ; Handle remaining 0-511 bytes — full 64-byte chunks, then opmask tail
