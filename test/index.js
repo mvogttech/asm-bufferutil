@@ -307,6 +307,118 @@ console.log('\nmask() NT-store path tests (>= 256KB):');
   assert(buffersEqual(maskSlice1, maskSlice2), '512 KB unmask, misaligned buffer — NT prologue mask cycling');
 }
 
+// --- Test: batchUnmask function (packed buffer API) ---
+if (typeof asmUtil.batchUnmask === 'function') {
+  console.log('\nbatchUnmask() tests:');
+
+  // Basic batch unmask with known values
+  {
+    // Pack two frames: [0x01,0x02,0x03] at offset 0, [0x10,0x20,0x30,0x40] at offset 3
+    const data = Buffer.from([0x01, 0x02, 0x03, 0x10, 0x20, 0x30, 0x40]);
+    const offsets = Buffer.alloc(8);
+    offsets.writeUInt32LE(0, 0);
+    offsets.writeUInt32LE(3, 4);
+    const lengths = Buffer.alloc(8);
+    lengths.writeUInt32LE(3, 0);
+    lengths.writeUInt32LE(4, 4);
+    const masks = Buffer.from([0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44]);
+
+    asmUtil.batchUnmask(data, offsets, lengths, masks, 2);
+
+    assert(data[0] === (0x01 ^ 0xAA) && data[1] === (0x02 ^ 0xBB) && data[2] === (0x03 ^ 0xCC),
+      'Batch unmask: first frame correct');
+    assert(data[3] === (0x10 ^ 0x11) && data[4] === (0x20 ^ 0x22) && data[5] === (0x30 ^ 0x33) && data[6] === (0x40 ^ 0x44),
+      'Batch unmask: second frame correct');
+  }
+
+  // Batch unmask matches individual unmask (50 frames packed)
+  {
+    const count = 50;
+    const frameSizes = [];
+    let totalSize = 0;
+    for (let i = 0; i < count; i++) {
+      const size = 10 + Math.floor(Math.random() * 200);
+      frameSizes.push(size);
+      totalSize += size;
+    }
+
+    const data = crypto.randomBytes(totalSize);
+    const refData = Buffer.from(data);
+    const offsets = Buffer.alloc(count * 4);
+    const lengths = Buffer.alloc(count * 4);
+    const masks = crypto.randomBytes(count * 4);
+
+    let off = 0;
+    for (let i = 0; i < count; i++) {
+      offsets.writeUInt32LE(off, i * 4);
+      lengths.writeUInt32LE(frameSizes[i], i * 4);
+      off += frameSizes[i];
+    }
+
+    // Individual unmask on reference
+    for (let i = 0; i < count; i++) {
+      const o = offsets.readUInt32LE(i * 4);
+      const l = lengths.readUInt32LE(i * 4);
+      const slice = refData.subarray(o, o + l);
+      asmUtil.unmask(slice, masks.subarray(i * 4, i * 4 + 4));
+    }
+
+    // Batch unmask
+    asmUtil.batchUnmask(data, offsets, lengths, masks, count);
+
+    assert(buffersEqual(data, refData), 'Batch unmask (50 frames) matches individual unmask');
+  }
+
+  // Empty batch
+  {
+    asmUtil.batchUnmask(Buffer.alloc(0), Buffer.alloc(0), Buffer.alloc(0), Buffer.alloc(0), 0);
+    assert(true, 'Empty batch unmask does not crash');
+  }
+}
+
+// --- Test: batchMask function (packed buffer API) ---
+if (typeof asmUtil.batchMask === 'function') {
+  console.log('\nbatchMask() tests:');
+
+  // Batch mask matches individual mask (50 frames packed)
+  {
+    const count = 50;
+    const frameSizes = [];
+    let totalSize = 0;
+    for (let i = 0; i < count; i++) {
+      const size = 10 + Math.floor(Math.random() * 200);
+      frameSizes.push(size);
+      totalSize += size;
+    }
+
+    const src = crypto.randomBytes(totalSize);
+    const dst = Buffer.alloc(totalSize);
+    const refDst = Buffer.alloc(totalSize);
+    const offsets = Buffer.alloc(count * 4);
+    const lengths = Buffer.alloc(count * 4);
+    const masks = crypto.randomBytes(count * 4);
+
+    let off = 0;
+    for (let i = 0; i < count; i++) {
+      offsets.writeUInt32LE(off, i * 4);
+      lengths.writeUInt32LE(frameSizes[i], i * 4);
+      off += frameSizes[i];
+    }
+
+    // Individual mask on reference
+    for (let i = 0; i < count; i++) {
+      const o = offsets.readUInt32LE(i * 4);
+      const l = lengths.readUInt32LE(i * 4);
+      asmUtil.mask(src.subarray(o, o + l), masks.subarray(i * 4, i * 4 + 4), refDst, o, l);
+    }
+
+    // Batch mask
+    asmUtil.batchMask(src, dst, offsets, lengths, masks, count);
+
+    assert(buffersEqual(dst, refDst), 'Batch mask (50 frames) matches individual mask');
+  }
+}
+
 // --- Test: cpuFeatures bitmask (if available) ---
 if (typeof asmUtil.cpuFeatures === 'number') {
   console.log('\ncpuFeatures bitmask:');

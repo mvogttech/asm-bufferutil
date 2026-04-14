@@ -232,6 +232,65 @@ for (const { name, size } of sizes) {
   );
 }
 
+// ── Batch unmask benchmark (packed buffer API) ──────────────────────────────
+
+if (asmUtil?.batchUnmask) {
+  console.log('\n=== Batch Unmask \u2014 packed buffer (amortized call overhead) ===');
+  console.log(
+    'Batch'.padEnd(14) +
+    '  individual'.padEnd(14) +
+    '  batch'.padEnd(14) +
+    '  speedup'.padEnd(10) +
+    '  spread'
+  );
+  console.log('\u2500'.repeat(60));
+
+  const frameSize = 64;  // typical small WebSocket frame
+
+  const batchSizes = [10, 50, 100, 500];
+
+  for (const count of batchSizes) {
+    const totalSize = count * frameSize;
+    const template = crypto.randomBytes(totalSize);
+    const masks = crypto.randomBytes(count * 4);
+    const offsets = Buffer.alloc(count * 4);
+    const lengths = Buffer.alloc(count * 4);
+    for (let i = 0; i < count; i++) {
+      offsets.writeUInt32LE(i * frameSize, i * 4);
+      lengths.writeUInt32LE(frameSize, i * 4);
+    }
+    const maskSlices = Array.from({length: count}, (_, i) => masks.subarray(i * 4, i * 4 + 4));
+
+    // Pre-allocate copies
+    const indivBufs = Array.from({length: count}, (_, i) =>
+      Buffer.from(template.subarray(i * frameSize, (i + 1) * frameSize)));
+
+    collectGarbage();
+    const indivRes = benchmark(() => {
+      template.copy(Buffer.from(template)); // reset isn't needed, unmask is XOR idempotent over two calls
+      for (let i = 0; i < count; i++) {
+        asmUtil.unmask(indivBufs[i], maskSlices[i]);
+      }
+    });
+
+    collectGarbage();
+    const packedBuf = Buffer.alloc(totalSize);
+    const batchRes = benchmark(() => {
+      template.copy(packedBuf);
+      asmUtil.batchUnmask(packedBuf, offsets, lengths, masks, count);
+    });
+
+    const name = `${count}\u00d7${frameSize}B`;
+    console.log(
+      name.padEnd(14) +
+      fmtOps(indivRes.median) +
+      fmtOps(batchRes.median) +
+      fmtSpeedup(batchRes.median, indivRes.median).padStart(10) +
+      ('  ' + fmtRange(batchRes))
+    );
+  }
+}
+
 // ── SHA-1 benchmark ─────────────────────────────────────────────────────────
 
 if (asmUtil?.hasShaNi) {

@@ -77,6 +77,56 @@ static void Base64Encode(const v8::FunctionCallbackInfo<v8::Value>& args) {
 }
 
 /* ====================================================================
+ * Batch operations — amortize V8 call overhead across many frames
+ *
+ * Uses packed buffers so the inner C loop has ZERO V8 API calls —
+ * just pointer arithmetic and ws_unmask/ws_mask assembly calls.
+ * ==================================================================== */
+
+/* batchUnmask(data, offsets, lengths, masks, count)
+ *   data:    Buffer — packed frame payloads (unmasked in-place)
+ *   offsets: Buffer — uint32_t[] byte offsets into data for each frame
+ *   lengths: Buffer — uint32_t[] byte lengths for each frame
+ *   masks:   Buffer — 4 bytes per frame, concatenated
+ *   count:   Number — number of frames
+ */
+static void BatchUnmask(const v8::FunctionCallbackInfo<v8::Value>& args) {
+    auto ctx = args.GetIsolate()->GetCurrentContext();
+    auto *data    = reinterpret_cast<uint8_t*>(node::Buffer::Data(args[0]));
+    auto *offsets = reinterpret_cast<uint32_t*>(node::Buffer::Data(args[1]));
+    auto *lengths = reinterpret_cast<uint32_t*>(node::Buffer::Data(args[2]));
+    auto *masks   = reinterpret_cast<uint8_t*>(node::Buffer::Data(args[3]));
+    uint32_t count = args[4]->Uint32Value(ctx).FromJust();
+
+    for (uint32_t i = 0; i < count; i++) {
+        ws_unmask(data + offsets[i], masks + i * 4, lengths[i]);
+    }
+}
+
+/* batchMask(src, dst, offsets, lengths, masks, count)
+ *   src:     Buffer — packed source payloads
+ *   dst:     Buffer — packed output buffer (masked data written here)
+ *   offsets: Buffer — uint32_t[] byte offsets (same for src and dst)
+ *   lengths: Buffer — uint32_t[] byte lengths for each frame
+ *   masks:   Buffer — 4 bytes per frame, concatenated
+ *   count:   Number — number of frames
+ */
+static void BatchMask(const v8::FunctionCallbackInfo<v8::Value>& args) {
+    auto ctx = args.GetIsolate()->GetCurrentContext();
+    auto *src     = reinterpret_cast<uint8_t*>(node::Buffer::Data(args[0]));
+    auto *dst     = reinterpret_cast<uint8_t*>(node::Buffer::Data(args[1]));
+    auto *offsets = reinterpret_cast<uint32_t*>(node::Buffer::Data(args[2]));
+    auto *lengths = reinterpret_cast<uint32_t*>(node::Buffer::Data(args[3]));
+    auto *masks   = reinterpret_cast<uint8_t*>(node::Buffer::Data(args[4]));
+    uint32_t count = args[5]->Uint32Value(ctx).FromJust();
+
+    for (uint32_t i = 0; i < count; i++) {
+        ws_mask(src + offsets[i], masks + i * 4,
+                dst + offsets[i], 0, lengths[i]);
+    }
+}
+
+/* ====================================================================
  * Module initialization
  * ==================================================================== */
 
@@ -91,6 +141,8 @@ NODE_MODULE_INIT(/* exports, module, context */) {
         {"sha1",         Sha1},
         {"findHeader",   FindHeader},
         {"base64Encode", Base64Encode},
+        {"batchUnmask",  BatchUnmask},
+        {"batchMask",    BatchMask},
     };
 
     for (auto& fn : fns) {
