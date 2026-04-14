@@ -8,15 +8,17 @@
 ;                            Fallback: SSE4.2 PCMPISTRI (16B/iter)
 ;
 ; Key instructions utilized:
+;   VPXORD zmm, zmm, m512— memory-operand fused load+XOR (AVX-512F)
+;   VPXOR  ymm, ymm, m256— memory-operand fused load+XOR (AVX2)
 ;   VPBROADCASTD r8d     — GPR→ZMM dword broadcast (AVX-512F)
 ;   VPBROADCASTB eax     — GPR→ZMM byte broadcast (AVX-512BW)
-;   VPXORD zmm           — integer-domain XOR (AVX-512F)
 ;   VPCMPEQB k, zmm, zmm— byte compare to opmask (AVX-512BW)
 ;   KANDQ k, k, k        — AND opmask registers (AVX-512BW)
 ;   KORTESTQ k, k        — test opmask for any set bits (AVX-512BW)
 ;   vmovdqu8 {k1}        — opmask masked load/store (AVX-512BW)
 ;   BZHI rax, rax, rcx   — build tail opmask: lower rcx bits=1, upper=0 (BMI2)
 ;                          naturally handles rcx=64 (all-ones) with no branch
+;   RORX r64, r/m64, imm8— non-destructive rotate (BMI2, ws_mask_gfni GPR path)
 ;   KMOVQ k1, rax        — load opmask from GPR (AVX-512BW)
 ;   TZCNT rcx, rax       — count trailing zeros for candidate extraction (BMI1)
 ;   BLSR rax, rax        — clear lowest set bit for candidate iteration (BMI1)
@@ -25,7 +27,6 @@
 ;   PREFETCHNTA          — non-temporal prefetch (NT-store path only)
 ;   VMOVNTDQA            — non-temporal load hint (NT unmask path, rdi aligned)
 ;   VMOVNTDQ             — non-temporal store (cache-bypass)
-;   REP MOVSB            — fast memcpy (ERMS/FSRM)
 ;
 ; Build:
 ;   nasm -f elf64 ws_mask_asm.asm -o ws_mask_asm.o
@@ -79,7 +80,6 @@ ws_mask:
     ; 4x unrolled: 32 bytes per iteration
     mov rax, rcx
     shr rax, 5                  ; 32-byte chunks
-    test rax, rax
     jz .m_gpr8_rem
 
     align 16
@@ -106,7 +106,6 @@ ws_mask:
 .m_gpr8_rem:
     mov rax, rcx
     shr rax, 3                  ; remaining 8-byte chunks (0-3)
-    test rax, rax
     jz .m_scalar
 
 .m_gpr8:
@@ -172,45 +171,29 @@ ws_mask:
     ; 8x unrolled: 512 bytes/iter (rdx now 64-byte aligned)
     mov rax, rcx
     shr rax, 9
-    test rax, rax
     jz .m_512_tail
 
     align 32
 .m_512_512:
-    ; Software-pipelined: interleave load-XOR-store at 64-byte granularity
-    ; so loads of chunk N+1 overlap with stores of chunk N
+    ; 8x unrolled: memory-operand VPXORD fuses load+XOR into one instruction.
+    ; OoO engine (Zen 4: 320-entry ROB) overlaps loads and stores naturally.
     prefetcht0 [rdi + 2048]
 
-    vmovdqu64 zmm1, [rdi]
-    vpxord zmm1, zmm1, zmm0
-    vmovdqu64 zmm2, [rdi + 64]
+    vpxord zmm1, zmm0, [rdi]
+    vpxord zmm2, zmm0, [rdi + 64]
+    vpxord zmm3, zmm0, [rdi + 128]
+    vpxord zmm4, zmm0, [rdi + 192]
+    vpxord zmm5, zmm0, [rdi + 256]
+    vpxord zmm6, zmm0, [rdi + 320]
+    vpxord zmm7, zmm0, [rdi + 384]
+    vpxord zmm8, zmm0, [rdi + 448]
     vmovdqu64 [rdx], zmm1
-
-    vpxord zmm2, zmm2, zmm0
-    vmovdqu64 zmm3, [rdi + 128]
     vmovdqu64 [rdx + 64], zmm2
-
-    vpxord zmm3, zmm3, zmm0
-    vmovdqu64 zmm4, [rdi + 192]
     vmovdqu64 [rdx + 128], zmm3
-
-    vpxord zmm4, zmm4, zmm0
-    vmovdqu64 zmm5, [rdi + 256]
     vmovdqu64 [rdx + 192], zmm4
-
-    vpxord zmm5, zmm5, zmm0
-    vmovdqu64 zmm6, [rdi + 320]
     vmovdqu64 [rdx + 256], zmm5
-
-    vpxord zmm6, zmm6, zmm0
-    vmovdqu64 zmm7, [rdi + 384]
     vmovdqu64 [rdx + 320], zmm6
-
-    vpxord zmm7, zmm7, zmm0
-    vmovdqu64 zmm8, [rdi + 448]
     vmovdqu64 [rdx + 384], zmm7
-
-    vpxord zmm8, zmm8, zmm0
     vmovdqu64 [rdx + 448], zmm8
 
     add rdi, 512
@@ -230,8 +213,7 @@ ws_mask:
     jz .m_512_final
 
 .m_512_full64:
-    vmovdqu64 zmm1, [rdi]
-    vpxord zmm1, zmm1, zmm0
+    vpxord zmm1, zmm0, [rdi]
     vmovdqu64 [rdx], zmm1
     add rdi, 64
     add rdx, 64
@@ -279,20 +261,15 @@ ws_mask:
 .m_nt512_aligned:
     mov rax, rcx
     shr rax, 8                  ; 256-byte chunks
-    test rax, rax
     jz  .m_nt512_tail
 
     align 32
 .m_nt512_loop:
     prefetchnta [rdi + 1024]
-    vmovdqu64 zmm1, [rdi]
-    vmovdqu64 zmm2, [rdi + 64]
-    vmovdqu64 zmm3, [rdi + 128]
-    vmovdqu64 zmm4, [rdi + 192]
-    vpxord zmm1, zmm1, zmm0
-    vpxord zmm2, zmm2, zmm0
-    vpxord zmm3, zmm3, zmm0
-    vpxord zmm4, zmm4, zmm0
+    vpxord zmm1, zmm0, [rdi]
+    vpxord zmm2, zmm0, [rdi + 64]
+    vpxord zmm3, zmm0, [rdi + 128]
+    vpxord zmm4, zmm0, [rdi + 192]
     vmovntdq [rdx],       zmm1
     vmovntdq [rdx + 64],  zmm2
     vmovntdq [rdx + 128], zmm3
@@ -356,20 +333,15 @@ ws_mask:
 .m_avx2_aligned:
     mov rax, rcx
     shr rax, 7
-    test rax, rax
     jz .m_avx2_t32
 
     align 32
 .m_avx2_128:
     prefetcht0 [rdi + 512]
-    vmovdqu ymm1, [rdi]
-    vmovdqu ymm2, [rdi + 32]
-    vmovdqu ymm3, [rdi + 64]
-    vmovdqu ymm4, [rdi + 96]
-    vpxor ymm1, ymm1, ymm0
-    vpxor ymm2, ymm2, ymm0
-    vpxor ymm3, ymm3, ymm0
-    vpxor ymm4, ymm4, ymm0
+    vpxor ymm1, ymm0, [rdi]
+    vpxor ymm2, ymm0, [rdi + 32]
+    vpxor ymm3, ymm0, [rdi + 64]
+    vpxor ymm4, ymm0, [rdi + 96]
     vmovdqu [rdx], ymm1
     vmovdqu [rdx + 32], ymm2
     vmovdqu [rdx + 64], ymm3
@@ -385,12 +357,10 @@ ws_mask:
 .m_avx2_t32:
     mov rax, rcx
     shr rax, 5
-    test rax, rax
     jz .m_avx2_t_scalar
 
 .m_avx2_32:
-    vmovdqu ymm1, [rdi]
-    vpxor ymm1, ymm1, ymm0
+    vpxor ymm1, ymm0, [rdi]
     vmovdqu [rdx], ymm1
     add rdi, 32
     add rdx, 32
@@ -433,20 +403,15 @@ ws_mask:
 .m_nt_avx2_aligned:
     mov rax, rcx
     shr rax, 7                  ; 128-byte chunks
-    test rax, rax
     jz  .m_nt_avx2_tail
 
     align 32
 .m_nt_avx2_loop:
     prefetchnta [rdi + 512]
-    vmovdqu ymm1, [rdi]
-    vmovdqu ymm2, [rdi + 32]
-    vmovdqu ymm3, [rdi + 64]
-    vmovdqu ymm4, [rdi + 96]
-    vpxor ymm1, ymm1, ymm0
-    vpxor ymm2, ymm2, ymm0
-    vpxor ymm3, ymm3, ymm0
-    vpxor ymm4, ymm4, ymm0
+    vpxor ymm1, ymm0, [rdi]
+    vpxor ymm2, ymm0, [rdi + 32]
+    vpxor ymm3, ymm0, [rdi + 64]
+    vpxor ymm4, ymm0, [rdi + 96]
     vmovntdq [rdx],      ymm1
     vmovntdq [rdx + 32], ymm2
     vmovntdq [rdx + 64], ymm3
@@ -471,7 +436,6 @@ ws_mask:
 
     mov rax, rcx
     shr rax, 6
-    test rax, rax
     jz .m_sse2_t16
 
     align 16
@@ -499,7 +463,6 @@ ws_mask:
 .m_sse2_t16:
     mov rax, rcx
     shr rax, 4
-    test rax, rax
     jz .m_scalar
 
 .m_sse2_16:
@@ -518,7 +481,6 @@ ws_mask:
 .m_scalar:
     mov rax, rcx
     shr rax, 2
-    test rax, rax
     jz .m_bytes
 .m_dword:
     mov r9d, [rdi]
@@ -573,7 +535,6 @@ ws_unmask:
     ; 4x unrolled: 32 bytes per iteration
     mov rax, rcx
     shr rax, 5                  ; 32-byte chunks
-    test rax, rax
     jz .u_gpr8_rem
 
     align 16
@@ -599,7 +560,6 @@ ws_unmask:
 .u_gpr8_rem:
     mov rax, rcx
     shr rax, 3                  ; remaining 8-byte chunks (0-3)
-    test rax, rax
     jz .u_scalar
 
 .u_gpr8:
@@ -665,50 +625,34 @@ ws_unmask:
     ; TLB coverage for large in-place buffers.
     mov rax, rcx
     shr rax, 9                  ; iterations = len / 512
-    test rax, rax
     jz .u_512_tail
 
     lea r11, [rdi + rcx - 256]  ; r11 = back pointer (last 256-byte block)
 
     align 32
 .u_dual_512:
-    ; Software-pipelined: interleave load-XOR-store at 64-byte granularity
-    ; so loads of chunk N+1 overlap with stores of chunk N
+    ; Memory-operand VPXORD fuses load+XOR; OoO engine overlaps stores naturally.
     prefetcht0 [rdi + 1024]
     prefetcht0 [r11 - 768]
 
-    ; Front 256 bytes — interleaved
-    vmovdqu64 zmm1, [rdi]
-    vpxord zmm1, zmm1, zmm0
-    vmovdqu64 zmm2, [rdi + 64]
+    ; Front 256 bytes
+    vpxord zmm1, zmm0, [rdi]
+    vpxord zmm2, zmm0, [rdi + 64]
+    vpxord zmm3, zmm0, [rdi + 128]
+    vpxord zmm4, zmm0, [rdi + 192]
     vmovdqu64 [rdi], zmm1
-
-    vpxord zmm2, zmm2, zmm0
-    vmovdqu64 zmm3, [rdi + 128]
     vmovdqu64 [rdi + 64], zmm2
-
-    vpxord zmm3, zmm3, zmm0
-    vmovdqu64 zmm4, [rdi + 192]
     vmovdqu64 [rdi + 128], zmm3
-
-    vpxord zmm4, zmm4, zmm0
-    vmovdqu64 zmm5, [r11]
     vmovdqu64 [rdi + 192], zmm4
 
-    ; Back 256 bytes — interleaved
-    vpxord zmm5, zmm5, zmm0
-    vmovdqu64 zmm6, [r11 + 64]
+    ; Back 256 bytes
+    vpxord zmm5, zmm0, [r11]
+    vpxord zmm6, zmm0, [r11 + 64]
+    vpxord zmm7, zmm0, [r11 + 128]
+    vpxord zmm8, zmm0, [r11 + 192]
     vmovdqu64 [r11], zmm5
-
-    vpxord zmm6, zmm6, zmm0
-    vmovdqu64 zmm7, [r11 + 128]
     vmovdqu64 [r11 + 64], zmm6
-
-    vpxord zmm7, zmm7, zmm0
-    vmovdqu64 zmm8, [r11 + 192]
     vmovdqu64 [r11 + 128], zmm7
-
-    vpxord zmm8, zmm8, zmm0
     vmovdqu64 [r11 + 192], zmm8
 
     add rdi, 256
@@ -730,8 +674,7 @@ ws_unmask:
     jz .u_512_final
 
 .u_512_full64:
-    vmovdqu64 zmm1, [rdi]
-    vpxord zmm1, zmm1, zmm0
+    vpxord zmm1, zmm0, [rdi]
     vmovdqu64 [rdi], zmm1
     add rdi, 64
     sub rcx, 64
@@ -774,7 +717,6 @@ ws_unmask:
 .u_nt512_aligned:
     mov rax, rcx
     shr rax, 8
-    test rax, rax
     jz  .u_nt512_tail
 
     align 32
@@ -844,20 +786,15 @@ ws_unmask:
 .u_avx2_aligned:
     mov rax, rcx
     shr rax, 7
-    test rax, rax
     jz .u_avx2_t32
 
     align 32
 .u_avx2_128:
     prefetcht0 [rdi + 512]
-    vmovdqu ymm1, [rdi]
-    vmovdqu ymm2, [rdi + 32]
-    vmovdqu ymm3, [rdi + 64]
-    vmovdqu ymm4, [rdi + 96]
-    vpxor ymm1, ymm1, ymm0
-    vpxor ymm2, ymm2, ymm0
-    vpxor ymm3, ymm3, ymm0
-    vpxor ymm4, ymm4, ymm0
+    vpxor ymm1, ymm0, [rdi]
+    vpxor ymm2, ymm0, [rdi + 32]
+    vpxor ymm3, ymm0, [rdi + 64]
+    vpxor ymm4, ymm0, [rdi + 96]
     vmovdqu [rdi], ymm1
     vmovdqu [rdi + 32], ymm2
     vmovdqu [rdi + 64], ymm3
@@ -871,11 +808,9 @@ ws_unmask:
 .u_avx2_t32:
     mov rax, rcx
     shr rax, 5
-    test rax, rax
     jz .u_avx2_scalar
 .u_avx2_32:
-    vmovdqu ymm1, [rdi]
-    vpxor ymm1, ymm1, ymm0
+    vpxor ymm1, ymm0, [rdi]
     vmovdqu [rdi], ymm1
     add rdi, 32
     dec rax
@@ -914,7 +849,6 @@ ws_unmask:
 .u_nt_avx2_aligned:
     mov rax, rcx
     shr rax, 7                  ; 128-byte chunks
-    test rax, rax
     jz  .u_nt_avx2_tail
 
     align 32
@@ -951,7 +885,6 @@ ws_unmask:
 
     mov rax, rcx
     shr rax, 6
-    test rax, rax
     jz .u_sse2_t16
     align 16
 .u_sse2_64:
@@ -976,7 +909,6 @@ ws_unmask:
 .u_sse2_t16:
     mov rax, rcx
     shr rax, 4
-    test rax, rax
     jz .u_scalar
 .u_sse2_16:
     movdqu xmm1, [rdi]
@@ -992,7 +924,6 @@ ws_unmask:
 .u_scalar:
     mov rax, rcx
     shr rax, 2
-    test rax, rax
     jz .u_bytes
 .u_dword:
     xor dword [rdi], r8d
@@ -1484,7 +1415,6 @@ ws_unmask4:
     ; eax = min_len. Process full 64-byte chunks that ALL frames can do.
     mov ecx, eax
     shr ecx, 6                  ; ecx = number of full 64-byte iterations
-    test ecx, ecx
     jz .u4_tails
 
     ; Dispatch based on count for the bulk loop
@@ -1499,8 +1429,7 @@ ws_unmask4:
     ; ---- Bulk loop: 1 frame ----
     align 32
 .u4_bulk1:
-    vmovdqu64 zmm4, [rbp + r9]
-    vpxord zmm4, zmm4, zmm0
+    vpxord zmm4, zmm0, [rbp + r9]
     vmovdqu64 [rbp + r9], zmm4
     add r9, 64
     sub r13d, 64
@@ -1511,10 +1440,8 @@ ws_unmask4:
     ; ---- Bulk loop: 2 frames ----
     align 32
 .u4_bulk2:
-    vmovdqu64 zmm4, [rbp + r9]
-    vmovdqu64 zmm5, [rbp + r10]
-    vpxord zmm4, zmm4, zmm0
-    vpxord zmm5, zmm5, zmm1
+    vpxord zmm4, zmm0, [rbp + r9]
+    vpxord zmm5, zmm1, [rbp + r10]
     vmovdqu64 [rbp + r9], zmm4
     vmovdqu64 [rbp + r10], zmm5
     add r9, 64
@@ -1528,12 +1455,9 @@ ws_unmask4:
     ; ---- Bulk loop: 3 frames ----
     align 32
 .u4_bulk3:
-    vmovdqu64 zmm4, [rbp + r9]
-    vmovdqu64 zmm5, [rbp + r10]
-    vmovdqu64 zmm6, [rbp + r11]
-    vpxord zmm4, zmm4, zmm0
-    vpxord zmm5, zmm5, zmm1
-    vpxord zmm6, zmm6, zmm2
+    vpxord zmm4, zmm0, [rbp + r9]
+    vpxord zmm5, zmm1, [rbp + r10]
+    vpxord zmm6, zmm2, [rbp + r11]
     vmovdqu64 [rbp + r9], zmm4
     vmovdqu64 [rbp + r10], zmm5
     vmovdqu64 [rbp + r11], zmm6
@@ -1550,14 +1474,10 @@ ws_unmask4:
     ; ---- Bulk loop: 4 frames (maximum ILP) ----
     align 32
 .u4_bulk4:
-    vmovdqu64 zmm4, [rbp + r9]
-    vmovdqu64 zmm5, [rbp + r10]
-    vmovdqu64 zmm6, [rbp + r11]
-    vmovdqu64 zmm7, [rbp + r12]
-    vpxord zmm4, zmm4, zmm0
-    vpxord zmm5, zmm5, zmm1
-    vpxord zmm6, zmm6, zmm2
-    vpxord zmm7, zmm7, zmm3
+    vpxord zmm4, zmm0, [rbp + r9]
+    vpxord zmm5, zmm1, [rbp + r10]
+    vpxord zmm6, zmm2, [rbp + r11]
+    vpxord zmm7, zmm3, [rbp + r12]
     vmovdqu64 [rbp + r9], zmm4
     vmovdqu64 [rbp + r10], zmm5
     vmovdqu64 [rbp + r11], zmm6
@@ -1582,11 +1502,9 @@ ws_unmask4:
     ; Process remaining full 64-byte chunks for frame 0
     mov eax, r13d
     shr eax, 6
-    test eax, eax
     jz .u4_tail0_final
 .u4_tail0_64:
-    vmovdqu64 zmm4, [rbp + r9]
-    vpxord zmm4, zmm4, zmm0
+    vpxord zmm4, zmm0, [rbp + r9]
     vmovdqu64 [rbp + r9], zmm4
     add r9, 64
     sub r13d, 64
@@ -1610,11 +1528,9 @@ ws_unmask4:
 
     mov eax, r14d
     shr eax, 6
-    test eax, eax
     jz .u4_tail1_final
 .u4_tail1_64:
-    vmovdqu64 zmm5, [rbp + r10]
-    vpxord zmm5, zmm5, zmm1
+    vpxord zmm5, zmm1, [rbp + r10]
     vmovdqu64 [rbp + r10], zmm5
     add r10, 64
     sub r14d, 64
@@ -1637,11 +1553,9 @@ ws_unmask4:
 
     mov eax, r15d
     shr eax, 6
-    test eax, eax
     jz .u4_tail2_final
 .u4_tail2_64:
-    vmovdqu64 zmm6, [rbp + r11]
-    vpxord zmm6, zmm6, zmm2
+    vpxord zmm6, zmm2, [rbp + r11]
     vmovdqu64 [rbp + r11], zmm6
     add r11, 64
     sub r15d, 64
@@ -1664,11 +1578,9 @@ ws_unmask4:
 
     mov eax, ebx
     shr eax, 6
-    test eax, eax
     jz .u4_tail3_final
 .u4_tail3_64:
-    vmovdqu64 zmm7, [rbp + r12]
-    vpxord zmm7, zmm7, zmm3
+    vpxord zmm7, zmm3, [rbp + r12]
     vmovdqu64 [rbp + r12], zmm7
     add r12, 64
     sub ebx, 64
@@ -1783,7 +1695,6 @@ ws_mask4:
 .m4_min_done:
     mov ecx, eax
     shr ecx, 6                  ; ecx = full 64-byte iterations
-    test ecx, ecx
     jz .m4_tails
 
     cmp r8d, 4
@@ -1796,8 +1707,7 @@ ws_mask4:
     ; ---- Bulk loop: 1 frame (src != dst) ----
     align 32
 .m4_bulk1:
-    vmovdqu64 zmm4, [rbp + r10]
-    vpxord zmm4, zmm4, zmm0
+    vpxord zmm4, zmm0, [rbp + r10]
     vmovdqu64 [rdi + r10], zmm4
     add r10, 64
     sub r14d, 64
@@ -1808,10 +1718,8 @@ ws_mask4:
     ; ---- Bulk loop: 2 frames ----
     align 32
 .m4_bulk2:
-    vmovdqu64 zmm4, [rbp + r10]
-    vmovdqu64 zmm5, [rbp + r11]
-    vpxord zmm4, zmm4, zmm0
-    vpxord zmm5, zmm5, zmm1
+    vpxord zmm4, zmm0, [rbp + r10]
+    vpxord zmm5, zmm1, [rbp + r11]
     vmovdqu64 [rdi + r10], zmm4
     vmovdqu64 [rdi + r11], zmm5
     add r10, 64
@@ -1825,12 +1733,9 @@ ws_mask4:
     ; ---- Bulk loop: 3 frames ----
     align 32
 .m4_bulk3:
-    vmovdqu64 zmm4, [rbp + r10]
-    vmovdqu64 zmm5, [rbp + r11]
-    vmovdqu64 zmm6, [rbp + r12]
-    vpxord zmm4, zmm4, zmm0
-    vpxord zmm5, zmm5, zmm1
-    vpxord zmm6, zmm6, zmm2
+    vpxord zmm4, zmm0, [rbp + r10]
+    vpxord zmm5, zmm1, [rbp + r11]
+    vpxord zmm6, zmm2, [rbp + r12]
     vmovdqu64 [rdi + r10], zmm4
     vmovdqu64 [rdi + r11], zmm5
     vmovdqu64 [rdi + r12], zmm6
@@ -1847,14 +1752,10 @@ ws_mask4:
     ; ---- Bulk loop: 4 frames (maximum ILP) ----
     align 32
 .m4_bulk4:
-    vmovdqu64 zmm4, [rbp + r10]
-    vmovdqu64 zmm5, [rbp + r11]
-    vmovdqu64 zmm6, [rbp + r12]
-    vmovdqu64 zmm7, [rbp + r13]
-    vpxord zmm4, zmm4, zmm0
-    vpxord zmm5, zmm5, zmm1
-    vpxord zmm6, zmm6, zmm2
-    vpxord zmm7, zmm7, zmm3
+    vpxord zmm4, zmm0, [rbp + r10]
+    vpxord zmm5, zmm1, [rbp + r11]
+    vpxord zmm6, zmm2, [rbp + r12]
+    vpxord zmm7, zmm3, [rbp + r13]
     vmovdqu64 [rdi + r10], zmm4
     vmovdqu64 [rdi + r11], zmm5
     vmovdqu64 [rdi + r12], zmm6
@@ -1878,11 +1779,9 @@ ws_mask4:
 
     mov eax, r14d
     shr eax, 6
-    test eax, eax
     jz .m4_tail0_final
 .m4_tail0_64:
-    vmovdqu64 zmm4, [rbp + r10]
-    vpxord zmm4, zmm4, zmm0
+    vpxord zmm4, zmm0, [rbp + r10]
     vmovdqu64 [rdi + r10], zmm4
     add r10, 64
     sub r14d, 64
@@ -1905,11 +1804,9 @@ ws_mask4:
 
     mov eax, r15d
     shr eax, 6
-    test eax, eax
     jz .m4_tail1_final
 .m4_tail1_64:
-    vmovdqu64 zmm5, [rbp + r11]
-    vpxord zmm5, zmm5, zmm1
+    vpxord zmm5, zmm1, [rbp + r11]
     vmovdqu64 [rdi + r11], zmm5
     add r11, 64
     sub r15d, 64
@@ -1932,11 +1829,9 @@ ws_mask4:
 
     mov eax, ebx
     shr eax, 6
-    test eax, eax
     jz .m4_tail2_final
 .m4_tail2_64:
-    vmovdqu64 zmm6, [rbp + r12]
-    vpxord zmm6, zmm6, zmm2
+    vpxord zmm6, zmm2, [rbp + r12]
     vmovdqu64 [rdi + r12], zmm6
     add r12, 64
     sub ebx, 64
@@ -1959,11 +1854,9 @@ ws_mask4:
 
     mov eax, esi
     shr eax, 6
-    test eax, eax
     jz .m4_tail3_final
 .m4_tail3_64:
-    vmovdqu64 zmm7, [rbp + r13]
-    vpxord zmm7, zmm7, zmm3
+    vpxord zmm7, zmm3, [rbp + r13]
     vmovdqu64 [rdi + r13], zmm7
     add r13, 64
     sub esi, 64
@@ -2085,28 +1978,19 @@ ws_mask_gfni:
     ; 8x unrolled: 512 bytes/iter (rdx now 64-byte aligned)
     mov rax, rcx
     shr rax, 9
-    test rax, rax
     jz .gf_512_tail
 
     align 32
 .gf_512_loop:
     prefetcht0 [rdi + 2048]
-    vmovdqu64 zmm1, [rdi]
-    vmovdqu64 zmm2, [rdi + 64]
-    vmovdqu64 zmm3, [rdi + 128]
-    vmovdqu64 zmm4, [rdi + 192]
-    vmovdqu64 zmm5, [rdi + 256]
-    vmovdqu64 zmm6, [rdi + 320]
-    vmovdqu64 zmm7, [rdi + 384]
-    vmovdqu64 zmm8, [rdi + 448]
-    vpxord zmm1, zmm1, zmm0
-    vpxord zmm2, zmm2, zmm0
-    vpxord zmm3, zmm3, zmm0
-    vpxord zmm4, zmm4, zmm0
-    vpxord zmm5, zmm5, zmm0
-    vpxord zmm6, zmm6, zmm0
-    vpxord zmm7, zmm7, zmm0
-    vpxord zmm8, zmm8, zmm0
+    vpxord zmm1, zmm0, [rdi]
+    vpxord zmm2, zmm0, [rdi + 64]
+    vpxord zmm3, zmm0, [rdi + 128]
+    vpxord zmm4, zmm0, [rdi + 192]
+    vpxord zmm5, zmm0, [rdi + 256]
+    vpxord zmm6, zmm0, [rdi + 320]
+    vpxord zmm7, zmm0, [rdi + 384]
+    vpxord zmm8, zmm0, [rdi + 448]
     vmovdqu64 [rdx], zmm1
     vmovdqu64 [rdx + 64], zmm2
     vmovdqu64 [rdx + 128], zmm3
@@ -2132,8 +2016,7 @@ ws_mask_gfni:
     jz .gf_512_final
 
 .gf_512_full64:
-    vmovdqu64 zmm1, [rdi]
-    vpxord zmm1, zmm1, zmm0
+    vpxord zmm1, zmm0, [rdi]
     vmovdqu64 [rdx], zmm1
     add rdi, 64
     add rdx, 64
@@ -2156,14 +2039,13 @@ ws_mask_gfni:
     ret
 
     ; Small payload (<128 bytes) — reuse GPR path logic
+    ; RORX is safe here: ws_mask_gfni gates on AVX-512 + GFNI, so BMI2 is guaranteed.
 .gf_gpr_small:
-    mov r9, r8                      ; build 8-byte mask
-    shl r9, 32
-    or  r9, r8
+    rorx r9, r8, 32                ; r9 = r8d rotated to upper 32 bits
+    or   r9, r8                     ; r9 = 8-byte mask (r8d duplicated)
 
     mov rax, rcx
     shr rax, 5                      ; 32-byte chunks
-    test rax, rax
     jz .gf_gpr8_rem
 
     align 16
@@ -2190,7 +2072,6 @@ ws_mask_gfni:
 .gf_gpr8_rem:
     mov rax, rcx
     shr rax, 3
-    test rax, rax
     jz .gf_scalar
 
 .gf_gpr8:
@@ -2208,7 +2089,6 @@ ws_mask_gfni:
 .gf_scalar:
     mov rax, rcx
     shr rax, 2
-    test rax, rax
     jz .gf_bytes
 .gf_dword:
     mov r9d, [rdi]
