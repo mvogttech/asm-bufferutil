@@ -1,0 +1,78 @@
+name: Prebuild
+
+on:
+  # Manual trigger for building prebuilds on demand
+  workflow_dispatch:
+  # Automatically build on version tags
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  prebuild:
+    name: Prebuild ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest, macos-13]
+        # ubuntu-latest  = linux-x64
+        # windows-latest = win32-x64
+        # macos-latest   = darwin-arm64 (Apple Silicon)
+        # macos-13       = darwin-x64 (Intel Mac)
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install NASM
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y nasm
+
+      - name: Install dependencies
+        run: npm install --ignore-scripts
+
+      - name: Build prebuilds
+        run: npx prebuildify --strip --target=20.0.0 --target=22.0.0 --target=24.0.0
+
+      - name: Upload prebuilds
+        uses: actions/upload-artifact@v4
+        with:
+          name: prebuilds-${{ matrix.os }}
+          path: prebuilds/
+
+  # Collect all prebuilds into a single artifact
+  collect:
+    name: Collect prebuilds
+    needs: prebuild
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all prebuilds
+        uses: actions/download-artifact@v4
+        with:
+          path: prebuilds-all/
+          pattern: prebuilds-*
+
+      - name: Merge prebuilds into prebuilds/
+        run: |
+          mkdir -p prebuilds
+          for dir in prebuilds-all/prebuilds-*/; do
+            cp -r "$dir"/* prebuilds/ 2>/dev/null || true
+          done
+
+      - name: List prebuilds
+        run: find prebuilds -type f | sort
+
+      - name: Upload merged prebuilds
+        uses: actions/upload-artifact@v4
+        with:
+          name: prebuilds-all-platforms
+          path: prebuilds/
